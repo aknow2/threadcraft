@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-open-in-zed"
+description = "Enables the open_in_zed command without any pre-configured scope."
+commands.allow = ["open_in_zed"]
+
+[[permission]]
+identifier = "deny-open-in-zed"
+description = "Denies the open_in_zed command without any pre-configured scope."
+commands.deny = ["open_in_zed"]

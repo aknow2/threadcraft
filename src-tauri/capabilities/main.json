@@ -1,0 +1,34 @@
+{
+  "identifier": "main",
+  "description": "Local board operations only; no filesystem or shell access from the webview.",
+  "windows": ["main"],
+  "permissions": [
+    "allow-get-board",
+    "allow-create-thread",
+    "allow-mutate-board",
+    "allow-refresh-threads",
+    "allow-read-thread",
+    "allow-mark-thread-read",
+    "allow-open-in-zed",
+    "allow-send-message",
+    "allow-list-models",
+    "allow-stop-message",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        {
+          "url": "http://*"
+        },
+        {
+          "url": "https://*"
+        },
+        {
+          "url": "mailto:*"
+        }
+      ]
+    },
+    "allow-steer-message",
+    "allow-respond-to-request",
+    "allow-fork-thread"
+  ]
+}

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fork-thread"
+description = "Enables the fork_thread command without any pre-configured scope."
+commands.allow = ["fork_thread"]
+
+[[permission]]
+identifier = "deny-fork-thread"
+description = "Denies the fork_thread command without any pre-configured scope."
+commands.deny = ["fork_thread"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-refresh-threads"
+description = "Enables the refresh_threads command without any pre-configured scope."
+commands.allow = ["refresh_threads"]
+
+[[permission]]
+identifier = "deny-refresh-threads"
+description = "Denies the refresh_threads command without any pre-configured scope."
+commands.deny = ["refresh_threads"]

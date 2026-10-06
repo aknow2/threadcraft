@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mutate-board"
+description = "Enables the mutate_board command without any pre-configured scope."
+commands.allow = ["mutate_board"]
+
+[[permission]]
+identifier = "deny-mutate-board"
+description = "Denies the mutate_board command without any pre-configured scope."
+commands.deny = ["mutate_board"]

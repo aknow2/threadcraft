@@ -1,0 +1,27 @@
+[package]
+name = "treadcraft"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+default-run = "treadcraft"
+
+[lib]
+name = "treadcraft_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+base64 = "0.22"
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.38", features = ["bundled"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["process", "io-util", "time", "sync", "rt", "macros"] }
+tauri-plugin-opener = "2"
+
+[dev-dependencies]
+tempfile = "3"
