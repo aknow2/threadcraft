@@ -71,6 +71,11 @@ pub(crate) async fn list_threads_with_cancel(
 }
 
 enum Operation<'a> {
+    Update {
+        source: &'a str,
+        thread_id: &'a str,
+        update: &'a crate::model::ThreadUpdate,
+    },
     Fork(&'a str),
     Models,
     Inventory(&'a str),
@@ -78,6 +83,30 @@ enum Operation<'a> {
         thread_id: &'a str,
         cursor: Option<&'a str>,
     },
+}
+
+pub(crate) async fn update_thread(
+    path: &Path,
+    source: &str,
+    thread_id: &str,
+    update: &crate::model::ThreadUpdate,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<Vec<Thread>, AppError> {
+    update.validate()?;
+    match run_operation(
+        path,
+        Operation::Update {
+            source,
+            thread_id,
+            update,
+        },
+        shutdown,
+    )
+    .await?
+    {
+        Response::Inventory(threads) => Ok(threads),
+        _ => Err(AppError::UnsupportedVersion),
+    }
 }
 enum Response {
     Fork(RemoteThread),
@@ -221,6 +250,24 @@ async fn perform(
     request(child,lines,1,"initialize",json!({"clientInfo":{"name":"treadcraft","version":"0.1.0"},"capabilities":{"experimentalApi":true}})).await?;
     send(child, json!({"method":"initialized"})).await?;
     match operation {
+        Operation::Update {
+            source,
+            thread_id,
+            update,
+        } => {
+            use crate::model::ThreadUpdate;
+            let (method, params) = match update {
+                ThreadUpdate::Rename { name } => (
+                    "thread/name/set",
+                    json!({"threadId":thread_id,"name":name.trim()}),
+                ),
+                ThreadUpdate::Archive => ("thread/archive", json!({"threadId":thread_id})),
+                ThreadUpdate::Restore => ("thread/unarchive", json!({"threadId":thread_id})),
+            };
+            request(child, lines, 1000, method, params).await?;
+            // Refresh all pages, including descendants affected by archive.
+            Ok(Response::Inventory(inventory(child, lines, source).await?))
+        }
         Operation::Fork(id) => {
             let result = request(child, lines, 2, "thread/fork", json!({"threadId":id,"ephemeral":false,"excludeTurns":true,"deferGoalContinuation":true})).await?;
             let fork: RemoteThread = serde_json::from_value(result["thread"].clone())
@@ -330,6 +377,7 @@ fn parse_chat_page(value: Value) -> Result<ChatPage, AppError> {
                         .ok_or(AppError::UnsupportedVersion)?
                         .to_owned(),
                 ),
+                "fileChange" => ("activity", "ファイル変更（差分パネルで確認）".into()),
                 _ => ("activity", format!("{kind}（操作ログ・詳細は未表示）")),
             };
             Ok(ChatMessage {
@@ -337,6 +385,11 @@ fn parse_chat_page(value: Value) -> Result<ChatPage, AppError> {
                     .map_err(|_| AppError::UnsupportedVersion)?,
                 role: role.into(),
                 text,
+                file_change: if kind == "fileChange" {
+                    serde_json::from_value(item.clone()).ok()
+                } else {
+                    None
+                },
             })
         })
         .collect::<Result<Vec<_>, AppError>>()?;
@@ -509,6 +562,18 @@ mod tests {
         assert_eq!(page.next_cursor.as_deref(), Some("next"));
     }
     #[test]
+    fn history_preserves_file_edits_and_status() {
+        let page = parse_chat_page(json!({"data":[{"turnId":"t","item":{
+            "id":"edit","type":"fileChange","status":"declined",
+            "changes":[{"path":"src/app.rs","kind":{"type":"update","move_path":null},"diff":"@@ -1 +1 @@\n-old\n+new"}]
+        }}]})).unwrap();
+        let change = page.messages[0].file_change.as_ref().unwrap();
+        assert_eq!(change.status, "declined");
+        assert_eq!(change.changes[0].path, "src/app.rs");
+        assert!(change.changes[0].diff.contains("+new"));
+        assert_eq!(page.messages[0].id, "[\"t\",\"edit\"]");
+    }
+    #[test]
     fn tool_output_is_not_exposed_as_assistant_text() {
         let page=parse_chat_page(json!({"data":[{"turnId":"t","item":{"id":"c","type":"commandExecution","aggregatedOutput":"private-output"}}]})).unwrap();
         assert_eq!(page.messages[0].role, "activity");
@@ -537,9 +602,64 @@ mod tests {
     async fn forks_history_without_starting_a_turn() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/chat-server.mjs");
         let (_shutdown, rx) = tokio::sync::watch::channel(false);
-        let fork = fork_thread(&path, "source", "thread-test", rx).await.unwrap();
-        assert_eq!(fork.id, serde_json::to_string(&("source", "forked-thread")).unwrap());
+        let fork = fork_thread(&path, "source", "thread-test", rx)
+            .await
+            .unwrap();
+        assert_eq!(
+            fork.id,
+            serde_json::to_string(&("source", "forked-thread")).unwrap()
+        );
         assert_eq!(fork.title, "分岐元の会話");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn updates_names_archives_descendants_and_restores_without_starting_turns() {
+        use crate::model::ThreadUpdate;
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/thread-metadata-server.mjs");
+        for (id, update) in [
+            (
+                "parent",
+                ThreadUpdate::Rename {
+                    name: " 新しい名前 ".into(),
+                },
+            ),
+            ("parent", ThreadUpdate::Archive),
+            ("archived", ThreadUpdate::Restore),
+        ] {
+            let (_shutdown, rx) = tokio::sync::watch::channel(false);
+            let threads = update_thread(&path, "source", id, &update, rx)
+                .await
+                .unwrap();
+            assert_eq!(threads.len(), 3);
+            let find = |id: &str| {
+                threads
+                    .iter()
+                    .find(|thread| thread.id == format!("[\"source\",\"{id}\"]"))
+                    .unwrap()
+            };
+            match update {
+                ThreadUpdate::Rename { .. } => assert_eq!(find("parent").title, "新しい名前"),
+                ThreadUpdate::Archive => assert!(find("parent").archived && find("child").archived),
+                ThreadUpdate::Restore => assert!(!find("archived").archived),
+            }
+        }
+        let (_shutdown, rx) = tokio::sync::watch::channel(false);
+        assert!(update_thread(
+            &path,
+            "source",
+            "parent",
+            &ThreadUpdate::Rename {
+                name: "fail".into()
+            },
+            rx
+        )
+        .await
+        .is_err());
+        for name in [" ".to_owned(), "a\nb".to_owned(), "あ".repeat(121)] {
+            assert!(ThreadUpdate::Rename { name }.validate().is_err());
+        }
     }
 
     #[test]

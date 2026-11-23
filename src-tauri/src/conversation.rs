@@ -14,6 +14,9 @@ use tokio::{
 #[serde(tag = "type", rename_all = "camelCase")]
 pub(crate) enum ChatEvent {
     Ready,
+    FileChange {
+        message: crate::model::ChatMessage,
+    },
     Request {
         id: String,
         method: String,
@@ -202,6 +205,7 @@ async fn next(lines: &mut Lines<BufReader<ChildStdout>>) -> Result<Value, AppErr
     serde_json::from_str(&line).map_err(|_| AppError::UnsupportedVersion)
 }
 
+#[allow(clippy::too_many_arguments)] // The owned stream and its cancellation/control state are passed explicitly.
 async fn exchange(
     child: &mut Child,
     lines: &mut Lines<BufReader<ChildStdout>>,
@@ -285,6 +289,7 @@ async fn exchange(
         std::collections::HashMap::new();
     let mut file_changes: std::collections::HashMap<String, Value> =
         std::collections::HashMap::new();
+    let mut tool_calls: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
     loop {
         let value = tokio::select! {
           request = async {
@@ -329,11 +334,9 @@ async fn exchange(
                 .map_err(|_| {
                     error("送信結果を確認できませんでした。再送信前に履歴を確認してください。")
                 })??
-        } else {
-            if interactions.is_empty() {
-                timeout(Duration::from_secs(600), next(lines)).await.map_err(|_| error("応答がタイムアウトしました。履歴を確認してください。"))??
-            } else { next(lines).await? }
-        }; Ok::<Value, AppError>(value) } => value?,
+        } else if interactions.is_empty() {
+            timeout(Duration::from_secs(600), next(lines)).await.map_err(|_| error("応答がタイムアウトしました。履歴を確認してください。"))??
+        } else { next(lines).await? }; Ok::<Value, AppError>(value) } => value?,
         };
         if value.get("method").is_none() {
             if let Some(reply) = value["id"].as_u64().and_then(|id| pending.remove(&id)) {
@@ -361,6 +364,15 @@ async fn exchange(
             {
                 let id = uuid::Uuid::new_v4().to_string();
                 let mut params = value["params"].clone();
+                if matches!(
+                    method,
+                    "item/tool/requestUserInput" | "tool/requestUserInput"
+                ) {
+                    if let Some(approval) = crate::interactions::tool_approval(&params, &tool_calls)
+                    {
+                        params["toolApproval"] = approval;
+                    }
+                }
                 if let Some(changes) = params["itemId"]
                     .as_str()
                     .and_then(|item| file_changes.get(item))
@@ -371,6 +383,9 @@ async fn exchange(
                     params["formSupported"] = json!(crate::interactions::form_supported(
                         &params["requestedSchema"]
                     ));
+                    if let Some(approval) = crate::interactions::mcp_tool_approval(&params, &tool_calls) {
+                        params["toolApproval"] = approval;
+                    }
                 }
                 emit(ChatEvent::Request {
                     id: id.clone(),
@@ -404,6 +419,20 @@ async fn exchange(
         {
             if let Some(id) = value["params"]["item"]["id"].as_str() {
                 file_changes.insert(id.to_owned(), value["params"]["item"]["changes"].clone());
+            }
+        }
+        if value["params"]["threadId"] == thread
+            && turn
+                .as_deref()
+                .is_some_and(|id| value["params"]["turnId"] == id)
+            && value["params"]["item"]["type"] == "mcpToolCall"
+        {
+            if let Some(id) = value["params"]["item"]["id"].as_str() {
+                if value["method"] == "item/started" {
+                    tool_calls.insert(id.to_owned(), value["params"]["item"].clone());
+                } else if value["method"] == "item/completed" {
+                    tool_calls.remove(id);
+                }
             }
         }
 
@@ -466,6 +495,18 @@ fn server_error(reason: &Value) -> AppError {
 fn message_event(value: &Value) -> Option<ChatEvent> {
     let p = &value["params"];
     match value["method"].as_str()? {
+        "item/started" | "item/completed" if p["item"]["type"] == "fileChange" => {
+            let change = serde_json::from_value(p["item"].clone()).ok()?;
+            Some(ChatEvent::FileChange {
+                message: crate::model::ChatMessage {
+                    id: serde_json::to_string(&(p["turnId"].as_str()?, p["item"]["id"].as_str()?))
+                        .ok()?,
+                    role: "activity".into(),
+                    text: "ファイル変更（差分パネルで確認）".into(),
+                    file_change: Some(change),
+                },
+            })
+        }
         "item/agentMessage/delta" => Some(ChatEvent::Delta {
             id: p["itemId"].as_str()?.into(),
             text: p["delta"].as_str()?.into(),
@@ -558,6 +599,24 @@ mod tests {
             &json!({"method":"item/reasoning/textDelta","params":{"delta":"private"}})
         )
         .is_none());
+    }
+    #[test]
+    fn file_change_events_share_history_keys_and_preserve_status() {
+        for (method, status) in [
+            ("item/started", "inProgress"),
+            ("item/completed", "completed"),
+        ] {
+            let event = message_event(&json!({"method":method,"params":{
+                "turnId":"t","item":{"id":"edit","type":"fileChange","status":status,
+                "changes":[{"path":"a.rs","kind":{"type":"add"},"diff":"@@ -0,0 +1 @@\n+new"}]}
+            }}))
+            .unwrap();
+            let ChatEvent::FileChange { message } = event else {
+                panic!("expected file change")
+            };
+            assert_eq!(message.id, "[\"t\",\"edit\"]");
+            assert_eq!(message.file_change.unwrap().status, status);
+        }
     }
     #[test]
     fn maps_final_message() {
@@ -852,12 +911,34 @@ mod tests {
         let (sender, controls) = tokio::sync::mpsc::channel(1);
         let (reply, received) = tokio::sync::oneshot::channel();
         let reply = std::sync::Mutex::new(Some(reply));
-        let result = super::run(&fixture(), MessageRequest { controls: Some(controls), thread: "thread-test", new_workspace: None, text: "approval", images: &[], options: &SendOptions::default() }, stop, shutdown, |event| {
-            if let ChatEvent::Request { id, .. } = event {
-                sender.try_send(crate::active_sends::SteerRequest { response: Some((id, json!({"action":"accept"}))), text: String::new(), images: vec![], reply: reply.lock().unwrap().take().unwrap() }).unwrap();
-            }
-            Ok(())
-        }).await.unwrap();
+        let result = super::run(
+            &fixture(),
+            MessageRequest {
+                controls: Some(controls),
+                thread: "thread-test",
+                new_workspace: None,
+                text: "approval",
+                images: &[],
+                options: &SendOptions::default(),
+            },
+            stop,
+            shutdown,
+            |event| {
+                if let ChatEvent::Request { id, .. } = event {
+                    sender
+                        .try_send(crate::active_sends::SteerRequest {
+                            response: Some((id, json!({"action":"accept"}))),
+                            text: String::new(),
+                            images: vec![],
+                            reply: reply.lock().unwrap().take().unwrap(),
+                        })
+                        .unwrap();
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(result, "completed");
         assert!(received.await.unwrap().is_ok());
     }

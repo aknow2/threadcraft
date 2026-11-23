@@ -16,6 +16,7 @@ vi.mock("./api", async (original) => ({
   api: {
     board: vi.fn(),
     createThread: vi.fn(),
+    updateThread: vi.fn(),
     listModels: vi.fn(),
     refresh: vi.fn(),
     mutate: vi.fn(),
@@ -118,6 +119,53 @@ it("opens the chat on click and closes it without changing classification", asyn
     screen.queryByRole("complementary", { name: "チャット内容" }),
   ).toBeNull();
 });
+it("maximizes chat without losing the draft or reloading history and resets on close", async () => {
+  const board = fixture();
+  board.threads[0].groupId = "g";
+  vi.mocked(api.board).mockResolvedValue(board);
+  vi.mocked(api.refresh).mockResolvedValue(board);
+  const user = userEvent.setup();
+  const { container } = render(<App />);
+  await user.click(
+    await screen.findByRole("button", { name: "API の確認 のチャットを表示" }),
+  );
+  await screen.findByText("確認しました");
+  const input = screen.getByLabelText("メッセージ") as HTMLTextAreaElement;
+  await user.type(input, "入力途中のメッセージ");
+  const reads = vi.mocked(api.readThread).mock.calls.length;
+
+  await user.click(screen.getByRole("button", { name: "チャット欄を最大化" }));
+  expect(container.querySelector(".app.chat-maximized")).toBeTruthy();
+  expect(
+    screen
+      .getByRole("button", { name: "チャット欄を元の幅に戻す" })
+      .getAttribute("aria-pressed"),
+  ).toBe("true");
+  expect(screen.getByLabelText("メッセージ")).toBe(input);
+  expect(input.value).toBe("入力途中のメッセージ");
+
+  await user.click(
+    screen.getByRole("button", { name: "チャット欄を元の幅に戻す" }),
+  );
+  expect(container.querySelector(".app.chat-maximized")).toBeNull();
+  await user.click(screen.getByRole("button", { name: "チャット欄を最大化" }));
+  await user.click(input);
+  await user.keyboard("{Escape}");
+  expect(container.querySelector(".app.chat-maximized")).toBeNull();
+  expect(input.value).toBe("入力途中のメッセージ");
+  expect(api.readThread).toHaveBeenCalledTimes(reads);
+
+  await user.click(screen.getByRole("button", { name: "チャット欄を最大化" }));
+  await user.click(screen.getByRole("button", { name: "チャット欄を閉じる" }));
+  await user.click(
+    screen.getByRole("button", { name: "API の確認 のチャットを表示" }),
+  );
+  expect(container.querySelector(".app.chat-maximized")).toBeNull();
+  expect(
+    screen.getByRole("button", { name: "チャット欄を最大化" }),
+  ).toBeTruthy();
+});
+
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
@@ -144,10 +192,14 @@ it("creates a group and rejects an empty name", async () => {
   await user.click(screen.getByRole("button", { name: "＋ グループ作成" }));
   const dialog = screen.getByRole("dialog");
   expect(
-    (within(dialog).getByText("保存する") as HTMLButtonElement).disabled,
+    (
+      within(dialog).getByRole("button", {
+        name: "保存する",
+      }) as HTMLButtonElement
+    ).disabled,
   ).toBe(true);
   await user.type(within(dialog).getByLabelText(/グループ名/), "リリース");
-  await user.click(within(dialog).getByText("保存する"));
+  await user.click(within(dialog).getByRole("button", { name: "保存する" }));
   expect(api.mutate).toHaveBeenCalledWith(1, {
     type: "createGroup",
     name: "リリース",
@@ -1411,4 +1463,263 @@ it("reports favorite storage failures without showing an unsaved favorite", asyn
   } finally {
     storage.mockRestore();
   }
+});
+
+it("renames a thread through Codex and preserves its favorite", async () => {
+  const initial = fixture();
+  const renamed = {
+    ...initial,
+    revision: 2,
+    threads: [{ ...initial.threads[0], title: "新しい会話名" }],
+  };
+  vi.mocked(api.updateThread).mockResolvedValue(renamed);
+  render(<App />);
+  const user = userEvent.setup();
+  await user.click(
+    await screen.findByRole("button", {
+      name: "API の確認 をお気に入りに登録",
+    }),
+  );
+  await user.click(
+    screen.getByRole("button", { name: "API の確認 の名前を変更" }),
+  );
+  const modal = screen.getByRole("dialog", { name: "スレッド名を変更" });
+  await user.clear(within(modal).getByLabelText("スレッド名"));
+  await user.type(within(modal).getByLabelText("スレッド名"), "新しい会話名");
+  await user.click(within(modal).getByRole("button", { name: "名前を保存" }));
+  expect(api.updateThread).toHaveBeenCalledWith("t", {
+    type: "rename",
+    name: "新しい会話名",
+  });
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(
+    screen.getByRole("button", { name: "新しい会話名 をお気に入りから解除" }),
+  ).toBeTruthy();
+});
+
+it("archives and restores threads with their group membership intact", async () => {
+  const initial = fixture();
+  initial.threads[0].groupId = "g";
+  vi.mocked(api.board).mockResolvedValue(initial);
+  vi.mocked(api.refresh).mockResolvedValue(initial);
+  const archived = {
+    ...initial,
+    revision: 2,
+    threads: [{ ...initial.threads[0], archived: true }],
+  };
+  const restored = { ...initial, revision: 3 };
+  vi.mocked(api.updateThread)
+    .mockResolvedValueOnce(archived)
+    .mockResolvedValueOnce(restored);
+  render(<App />);
+  const user = userEvent.setup();
+  await user.click(
+    await screen.findByRole("button", { name: "API の確認 をアーカイブ" }),
+  );
+  await waitFor(() =>
+    expect(
+      screen.queryByRole("button", { name: "API の確認 のチャットを表示" }),
+    ).toBeNull(),
+  );
+  await user.click(
+    screen.getByRole("button", { name: "アーカイブしたスレッド" }),
+  );
+  const modal = screen.getByRole("dialog", { name: "アーカイブしたスレッド" });
+  expect(within(modal).getByText(/調査 ·/)).toBeTruthy();
+  await user.click(
+    within(modal).getByRole("button", { name: "API の確認 を復元" }),
+  );
+  await waitFor(() =>
+    expect(
+      within(modal).queryByRole("button", { name: "API の確認 を復元" }),
+    ).toBeNull(),
+  );
+  await user.click(within(modal).getByRole("button", { name: "閉じる" }));
+  expect(
+    screen.getByRole("button", { name: "API の確認 のチャットを表示" }),
+  ).toBeTruthy();
+  expect(api.updateThread).toHaveBeenNthCalledWith(1, "t", { type: "archive" });
+  expect(api.updateThread).toHaveBeenNthCalledWith(2, "t", { type: "restore" });
+});
+
+it("preserves the entered thread name when a rename fails", async () => {
+  vi.mocked(api.updateThread).mockRejectedValue("更新に失敗");
+  render(<App />);
+  const user = userEvent.setup();
+  await user.click(
+    await screen.findByRole("button", { name: "API の確認 の名前を変更" }),
+  );
+  const modal = screen.getByRole("dialog", { name: "スレッド名を変更" });
+  const input = within(modal).getByLabelText("スレッド名");
+  await user.clear(input);
+  expect(
+    (
+      within(modal).getByRole("button", {
+        name: "名前を保存",
+      }) as HTMLButtonElement
+    ).disabled,
+  ).toBe(true);
+  await user.type(input, "修正名");
+  await user.click(within(modal).getByRole("button", { name: "名前を保存" }));
+  await within(modal).findByText("更新に失敗");
+  expect((input as HTMLInputElement).value).toBe("修正名");
+  expect(
+    screen.getByRole("button", { name: "API の確認 を選択" }),
+  ).toBeTruthy();
+});
+
+it("switches the left lane to Doing cards across groups, oldest updates first", async () => {
+  const board = fixture();
+  const base = board.threads[0];
+  board.threads = [
+    {
+      ...base,
+      id: "new",
+      title: "新しい更新",
+      groupId: "g",
+      createdAt: 1,
+      updatedAt: 80,
+      unread: true,
+    },
+    {
+      ...base,
+      id: "old",
+      title: "古い更新",
+      createdAt: 100,
+      updatedAt: 30,
+      unread: true,
+    },
+    {
+      ...base,
+      id: "fallback",
+      title: "更新時刻なし",
+      groupId: "g",
+      createdAt: 50,
+      updatedAt: 0,
+      unread: true,
+    },
+    {
+      ...base,
+      id: "read",
+      title: "既読の会話",
+      groupId: "g",
+      updatedAt: 5,
+      unread: false,
+    },
+    {
+      ...base,
+      id: "archived",
+      title: "アーカイブの未読",
+      updatedAt: 1,
+      archived: true,
+      unread: true,
+    },
+  ];
+  vi.mocked(api.board).mockResolvedValue(board);
+  vi.mocked(api.refresh).mockResolvedValue(board);
+  render(<App />);
+  const user = userEvent.setup();
+  await screen.findByRole("button", { name: "古い更新 を選択" });
+  await user.click(screen.getByRole("tab", { name: "Doing" }));
+  const list = screen.getByRole("tabpanel", { name: "Doing" });
+  expect(
+    Array.from(list.querySelectorAll(".thread h3")).map(
+      (node) => node.textContent,
+    ),
+  ).toEqual(["古い更新", "更新時刻なし", "新しい更新"]);
+  expect(
+    within(list).getByRole("button", { name: "古い更新 のチャットを表示" }),
+  ).toBeTruthy();
+  expect(within(list).queryByText("既読の会話")).toBeNull();
+  expect(within(list).queryByText("アーカイブの未読")).toBeNull();
+  expect(screen.getByText("更新日時 · 古い順")).toBeTruthy();
+  await user.type(screen.getByLabelText("スレッドを検索"), "新しい更新");
+  expect(list.querySelectorAll(".thread")).toHaveLength(1);
+  expect(api.mutate).not.toHaveBeenCalled();
+  await user.clear(screen.getByLabelText("スレッドを検索"));
+  await user.click(screen.getByRole("tab", { name: "未分類" }));
+  const inbox = screen.getByRole("tabpanel", { name: "未分類" });
+  expect(within(inbox).queryByText("新しい更新")).toBeNull();
+  expect(
+    within(inbox).getByRole("button", { name: "古い更新 を選択" }),
+  ).toBeTruthy();
+});
+
+it("keeps acknowledged cards in Doing until the Doing-only remove button is clicked", async () => {
+  vi.spyOn(document, "hasFocus").mockReturnValue(true);
+  const board = fixture();
+  board.threads[0] = { ...board.threads[0], updatedAt: 10, unread: true };
+  vi.mocked(api.board).mockResolvedValue(board);
+  vi.mocked(api.refresh).mockResolvedValue(board);
+  vi.mocked(api.readThread).mockResolvedValue({
+    messages: [{ id: "m", role: "assistant", text: "回答" }],
+    nextCursor: null,
+    observedUpdatedAt: 10,
+  });
+  vi.mocked(api.markThreadRead).mockResolvedValue({
+    ...board,
+    revision: 2,
+    threads: [{ ...board.threads[0], unread: false }],
+  });
+  render(<App />);
+  const user = userEvent.setup();
+  await screen.findByRole("button", { name: "API の確認 を選択" });
+  await user.click(screen.getByRole("tab", { name: "Doing" }));
+  const list = screen.getByRole("tabpanel", { name: "Doing" });
+  await user.click(
+    within(list).getByRole("button", { name: "API の確認 のチャットを表示" }),
+  );
+  await within(screen.getByRole("complementary")).findByRole("heading", {
+    name: "API の確認",
+  });
+  await waitFor(() => expect(api.markThreadRead).toHaveBeenCalledWith("t", 10));
+  await waitFor(() => expect(within(list).queryByLabelText("未読")).toBeNull());
+  expect(
+    within(list).getByRole("button", { name: "API の確認 のチャットを表示" }),
+  ).toBeTruthy();
+  expect(
+    screen.getAllByRole("button", { name: "API の確認 をDoingから外す" }),
+  ).toHaveLength(1);
+  await user.click(
+    within(list).getByRole("button", { name: "API の確認 をDoingから外す" }),
+  );
+  expect(
+    within(list).queryByRole("button", { name: "API の確認 のチャットを表示" }),
+  ).toBeNull();
+  expect(within(list).getByText("Doingのスレッドはありません")).toBeTruthy();
+  expect(
+    within(screen.getByRole("complementary")).getByRole("heading", {
+      name: "API の確認",
+    }),
+  ).toBeTruthy();
+  await user.click(screen.getByRole("tab", { name: "未分類" }));
+  expect(
+    screen.queryByRole("button", { name: "API の確認 をDoingから外す" }),
+  ).toBeNull();
+  expect(
+    screen.getByRole("button", { name: "API の確認 を選択" }),
+  ).toBeTruthy();
+  await user.click(screen.getByRole("tab", { name: "Doing" }));
+  expect(
+    screen.getByRole("tab", { name: "Doing" }).getAttribute("aria-selected"),
+  ).toBe("true");
+  expect(api.readThread).toHaveBeenCalledWith("t");
+  expect(api.mutate).not.toHaveBeenCalled();
+});
+
+it("switches inbox tabs with the keyboard", async () => {
+  render(<App />);
+  await screen.findByRole("button", { name: "API の確認 を選択" });
+  const user = userEvent.setup();
+  screen.getByRole("tab", { name: "未分類" }).focus();
+  await user.keyboard("{ArrowRight}");
+  expect(document.activeElement).toBe(
+    screen.getByRole("tab", { name: "Doing" }),
+  );
+  expect(screen.getByRole("tabpanel", { name: "Doing" })).toBeTruthy();
+  await user.keyboard("{Home}");
+  expect(document.activeElement).toBe(
+    screen.getByRole("tab", { name: "未分類" }),
+  );
+  expect(screen.getByRole("tabpanel", { name: "未分類" })).toBeTruthy();
 });

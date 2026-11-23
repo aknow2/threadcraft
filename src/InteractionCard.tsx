@@ -1,13 +1,23 @@
-import { useRef, useState } from "react";
+import Icon from "./Icon";
+import { useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api, errorMessage, type InteractionRequest } from "./api";
+import {
+  canRememberApproval,
+  hasSavedApproval,
+  approveAndRemember,
+} from "./approvalPreferences";
 
 export default function InteractionCard({
   threadId,
   request,
+  approvalScope = "",
+  onRememberError,
 }: {
   threadId: string;
   request: InteractionRequest;
+  approvalScope?: string;
+  onRememberError?: (message: string) => void;
 }) {
   const { params: p, method } = request;
   const [answers, setAnswers] = useState<Record<string, string>>({});
@@ -17,25 +27,62 @@ export default function InteractionCard({
   const [busy, setBusy] = useState(false);
   const lock = useRef(false);
   const [error, setError] = useState("");
-  async function respond(action: string) {
+  const rememberable = !!approvalScope && canRememberApproval(request);
+  const [remember, setRemember] = useState(true);
+  const toolApproval = request.params.toolApproval;
+  async function respond(action: string, automatic = false) {
     if (lock.current) return;
     lock.current = true;
     setBusy(true);
     setError("");
     try {
-      await api.respondToRequest(threadId, request.id, {
-        action,
-        answers,
-        content,
-      });
+      const toolLabel =
+        toolApproval &&
+        toolApproval.protocol !== "elicitation" &&
+        (
+          {
+            accept: toolApproval.acceptLabel,
+            decline: toolApproval.declineLabel,
+            cancel: toolApproval.cancelLabel,
+          } as Record<string, string>
+        )[action];
+      const send = () =>
+        api.respondToRequest(threadId, request.id, {
+          action: toolLabel ? "answer" : action,
+          answers:
+            toolLabel && toolApproval
+              ? { [toolApproval.questionId]: toolLabel }
+              : answers,
+          content,
+        });
+      if (!automatic && action === "accept" && rememberable && remember) {
+        if (!(await approveAndRemember(approvalScope, request, send)))
+          onRememberError?.(
+            "今回の許可は送信しましたが、次回用の許可を保存できませんでした。",
+          );
+      } else await send();
     } catch (error) {
       setError(errorMessage(error));
       lock.current = false;
       setBusy(false);
     }
   }
-  const question = method === "item/tool/requestUserInput";
-  const mcp = method === "mcpServer/elicitation/request";
+  useEffect(() => {
+    let disposed = false;
+    if (rememberable)
+      void hasSavedApproval(approvalScope, request).then((saved) => {
+        if (saved && !disposed && !lock.current) void respond("accept", true);
+      });
+    return () => {
+      disposed = true;
+    };
+    // One immutable approval request per card; edited answers are never replayed.
+  }, [request.id, approvalScope]);
+  const question =
+    !toolApproval &&
+    (method === "item/tool/requestUserInput" ||
+      method === "tool/requestUserInput");
+  const mcp = method === "mcpServer/elicitation/request" && !toolApproval;
   const permission = method === "item/permissions/requestApproval";
   const allowed = (decision: string) =>
     !p.availableDecisions || p.availableDecisions.includes(decision);
@@ -51,7 +98,9 @@ export default function InteractionCard({
             ? `${p.serverName ?? "ツール"}からの確認`
             : permission
               ? "追加権限の確認"
-              : "操作の承認"}
+              : toolApproval
+                ? `${toolApproval.tool} の実行許可`
+                : "操作の承認"}
       </h3>
       {p.reason && <p>{p.reason}</p>}
       {p.message && <p>{p.message}</p>}
@@ -64,7 +113,7 @@ export default function InteractionCard({
           {p.networkApprovalContext.host}
         </p>
       )}
-      {(p.permissions || p.additionalPermissions || p.changes) ? (
+      {p.permissions || p.additionalPermissions || p.changes ? (
         <pre>
           {JSON.stringify(
             p.permissions ?? p.additionalPermissions ?? p.changes,
@@ -115,6 +164,7 @@ export default function InteractionCard({
               void openUrl(p.url!).catch((e) => setError(errorMessage(e)))
             }
           >
+            <Icon name="external" />
             手続きのページを開く
           </button>
         </>
@@ -184,6 +234,19 @@ export default function InteractionCard({
             </label>
           ),
         )}
+      {rememberable && (
+        <label className="remember-approval">
+          <input
+            type="checkbox"
+            checked={remember}
+            disabled={busy}
+            onChange={(event) => setRemember(event.target.checked)}
+          />
+          {toolApproval
+            ? "このツールを次回から自動で許可（全作業フォルダ）"
+            : "同じ作業フォルダの同じ操作を次回から確認しない"}
+        </label>
+      )}
       <div className="interaction-actions">
         {question ? (
           <>
@@ -194,6 +257,7 @@ export default function InteractionCard({
               }
               onClick={() => void respond("answer")}
             >
+              <Icon name="send" />
               回答を送信
             </button>
             <button
@@ -201,6 +265,7 @@ export default function InteractionCard({
               disabled={busy}
               onClick={() => void respond("cancel")}
             >
+              <Icon name="close" />
               回答しない
             </button>
           </>
@@ -211,13 +276,19 @@ export default function InteractionCard({
               disabled={busy || (p.mode !== "url" && !p.formSupported)}
               onClick={() => void respond("accept")}
             >
-              {p.mode === "url" ? "完了" : "回答を送信"}
+              <Icon name="check" />
+              {p.mode === "url"
+                ? "完了"
+                : rememberable && remember
+                  ? "許可して記憶"
+                  : "回答を送信"}
             </button>
             <button
               type="button"
               disabled={busy}
               onClick={() => void respond("cancel")}
             >
+              <Icon name="close" />
               キャンセル
             </button>
           </>
@@ -229,7 +300,12 @@ export default function InteractionCard({
                 disabled={busy}
                 onClick={() => void respond("accept")}
               >
-                {permission ? "このターンで許可" : "今回のみ許可"}
+                <Icon name="check" />
+                {rememberable && remember
+                  ? "許可して記憶"
+                  : permission
+                    ? "このターンで許可"
+                    : "今回のみ許可"}
               </button>
             )}
             {allowed("decline") && (
@@ -238,6 +314,7 @@ export default function InteractionCard({
                 disabled={busy}
                 onClick={() => void respond("decline")}
               >
+                <Icon name="close" />
                 拒否
               </button>
             )}
@@ -247,6 +324,7 @@ export default function InteractionCard({
                 disabled={busy}
                 onClick={() => void respond("cancel")}
               >
+                <Icon name="close" />
                 キャンセル
               </button>
             )}

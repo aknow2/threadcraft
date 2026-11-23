@@ -51,12 +51,49 @@ pub struct Group {
     pub name: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
     pub id: String,
     pub role: String,
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_change: Option<FileChange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileChange {
+    pub status: String,
+    pub changes: Vec<FileEdit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEdit {
+    pub path: String,
+    pub kind: serde_json::Value,
+    pub diff: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ThreadUpdate {
+    Rename { name: String },
+    Archive,
+    Restore,
+}
+
+impl ThreadUpdate {
+    pub fn validate(&self) -> Result<(), AppError> {
+        if let Self::Rename { name } = self {
+            let name = name.trim();
+            if name.is_empty() || name.chars().count() > 120 || name.chars().any(char::is_control) {
+                return Err(AppError::Validation(
+                    "スレッド名は1〜120文字で入力してください。改行・制御文字は使えません。".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize)]

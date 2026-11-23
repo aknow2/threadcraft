@@ -601,7 +601,7 @@ it("drops an image, sends it without text, and retains it after failure", async 
   expect(screen.queryByAltText("sample.png")).toBeNull();
 });
 
-it("rejects non-image drops without sending", async () => {
+it("rejects empty file drops without sending", async () => {
   vi.mocked(api.readThread).mockResolvedValue({
     messages: [],
     nextCursor: null,
@@ -610,11 +610,11 @@ it("rejects non-image drops without sending", async () => {
   fireEvent.drop(screen.getByLabelText("メッセージ"), {
     dataTransfer: {
       types: ["Files"],
-      files: [new File(["text"], "file.txt", { type: "text/plain" })],
+      files: [new File([], "file.txt", { type: "text/plain" })],
     },
   });
   await screen.findByText(
-    "添付は合計4ファイルまで、各5MB以下のPNG・JPEG・WebP・GIF・PDFを指定してください。",
+    "添付は合計4ファイルまで、各5MB以下の空でないファイルを指定してください。",
   );
   expect(api.sendMessage).not.toHaveBeenCalled();
 });
@@ -695,9 +695,168 @@ it("opens a fork returned by the API without sending a message", async () => {
   render(<ChatPane thread={thread} close={() => {}} onFork={onFork} />);
   await screen.findByText("保存済みの会話");
   await userEvent.click(
-    screen.getByRole("button", { name: "この会話から分岐" }),
+    screen.getByRole("button", { name: "新しいスレッドに引き継ぐ" }),
   );
   expect(api.forkThread).toHaveBeenCalledWith("a");
-  expect(onFork).toHaveBeenCalledWith(result);
+  expect(onFork).toHaveBeenCalledWith(
+    result,
+    expect.objectContaining({ text: "", images: [] }),
+  );
   expect(api.sendMessage).not.toHaveBeenCalled();
+});
+
+it("recovers a writer conflict with the restored draft and attachments without resending", async () => {
+  vi.mocked(api.readThread).mockResolvedValue({
+    messages: [],
+    nextCursor: null,
+  });
+  vi.mocked(api.sendMessage).mockRejectedValue({ code: "ThreadInUse" });
+  const result = {
+    board: {
+      revision: 2,
+      lastSync: null,
+      groups: [],
+      threads: [{ ...thread, id: "recovered" }],
+    },
+    threadId: "recovered",
+  };
+  vi.mocked(api.forkThread).mockResolvedValue(result);
+  const onFork = vi.fn();
+  const images = [{ name: "notes.txt", url: "data:text/plain;base64,aGk=" }];
+  render(
+    <ChatPane
+      thread={thread}
+      close={() => {}}
+      onFork={onFork}
+      initialDraft="続きをお願いします"
+      initialImages={images}
+    />,
+  );
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "送信" }));
+  await screen.findByText("このスレッドは別の Codex 接続で使用中です");
+  await user.click(
+    screen.getByRole("button", { name: "新しいスレッドに引き継いで復旧" }),
+  );
+  expect(onFork).toHaveBeenCalledWith(
+    result,
+    expect.objectContaining({ text: "続きをお願いします", images }),
+  );
+  expect(api.sendMessage).toHaveBeenCalledTimes(1);
+});
+
+it("keeps the original draft when recovery fails", async () => {
+  vi.mocked(api.readThread).mockRejectedValue("読み込み失敗");
+  vi.mocked(api.forkThread).mockRejectedValue("引き継ぎ失敗");
+  const onFork = vi.fn();
+  render(
+    <ChatPane
+      thread={thread}
+      close={() => {}}
+      onFork={onFork}
+      initialDraft="残す文章"
+    />,
+  );
+  await userEvent.click(
+    screen.getByRole("button", { name: "新しいスレッドに引き継ぐ" }),
+  );
+  await screen.findByText("引き継ぎ失敗");
+  expect(onFork).not.toHaveBeenCalled();
+  expect(
+    (screen.getByLabelText("メッセージ") as HTMLTextAreaElement).value,
+  ).toBe("残す文章");
+  expect(api.sendMessage).not.toHaveBeenCalled();
+});
+
+it("shows streamed file edits and keeps them deduplicated after reloading history", async () => {
+  const message = {
+    id: '["turn","edit"]',
+    role: "activity" as const,
+    text: "ファイル変更",
+    fileChange: {
+      status: "completed",
+      changes: [
+        {
+          path: "app.ts",
+          kind: { type: "update" },
+          diff: "@@ -1 +1 @@\n-old\n+new",
+        },
+      ],
+    },
+  };
+  vi.mocked(api.readThread)
+    .mockResolvedValueOnce({ messages: [], nextCursor: null })
+    .mockResolvedValue({ messages: [message], nextCursor: null });
+  let finish!: (status: string) => void;
+  vi.mocked(api.sendMessage).mockImplementation((_id, _text, onEvent) => {
+    onEvent({
+      type: "fileChange",
+      message: {
+        ...message,
+        fileChange: { ...message.fileChange, status: "inProgress" },
+      },
+    });
+    onEvent({ type: "fileChange", message });
+    return new Promise((resolve) => {
+      finish = resolve;
+    });
+  });
+  render(<ChatPane thread={thread} close={() => {}} initialDraft="変更して" />);
+  await screen.findByText("保存されたメッセージはありません。");
+  await userEvent.click(
+    screen.getByRole("button", { name: "変更ファイル・差分" }),
+  );
+  await userEvent.click(screen.getByRole("button", { name: "送信" }));
+  expect(screen.getAllByRole("button", { name: /app.ts/ })).toHaveLength(1);
+  await userEvent.click(screen.getByRole("button", { name: /app.ts/ }));
+  expect(screen.getByText("+new")).toBeTruthy();
+  await act(async () => finish("completed"));
+  await waitFor(() =>
+    expect(screen.getAllByRole("button", { name: /app.ts/ })).toHaveLength(1),
+  );
+  expect(screen.getByText("適用済み")).toBeTruthy();
+  await userEvent.click(
+    screen.getByRole("button", { name: "差分パネルを閉じる" }),
+  );
+  expect(
+    screen.queryByRole("region", { name: "変更ファイルと差分" }),
+  ).toBeNull();
+});
+
+it("allows forking a started conversation that retains its local draft ID", async () => {
+  const localThread = { ...thread, id: '["source","draft:local-id"]' };
+  vi.mocked(api.readThread).mockResolvedValue({
+    messages: [{ id: "m", role: "assistant", text: "開始済みの会話" }],
+    nextCursor: null,
+  });
+  const result = {
+    board: {
+      revision: 2,
+      lastSync: null,
+      groups: [],
+      threads: [{ ...thread, id: "fork" }],
+    },
+    threadId: "fork",
+  };
+  vi.mocked(api.forkThread).mockResolvedValue(result);
+  const onFork = vi.fn();
+  render(
+    <ChatPane
+      thread={localThread}
+      close={() => {}}
+      onFork={onFork}
+      initialDraft="次の指示"
+    />,
+  );
+  await screen.findByText("開始済みの会話");
+  const button = screen.getByRole("button", {
+    name: "新しいスレッドに引き継ぐ",
+  });
+  expect((button as HTMLButtonElement).disabled).toBe(false);
+  await userEvent.click(button);
+  expect(api.forkThread).toHaveBeenCalledWith(localThread.id);
+  expect(onFork).toHaveBeenCalledWith(
+    result,
+    expect.objectContaining({ text: "次の指示" }),
+  );
 });

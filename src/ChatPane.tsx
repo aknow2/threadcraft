@@ -1,3 +1,6 @@
+import { approvalScope } from "./approvalPreferences";
+import ChangesPanel from "./ChangesPanel";
+import Icon from "./Icon";
 import { useEffect, useId, useRef, useState } from "react";
 import {
   api,
@@ -35,8 +38,19 @@ export default function ChatPane({
   initialQueue = [],
   onQueueChange,
   onFork,
+  maximized = false,
+  onToggleMaximized,
 }: {
-  onFork?: (result: { board: Board; threadId: string }) => void;
+  maximized?: boolean;
+  onToggleMaximized?: () => void;
+  onFork?: (
+    result: { board: Board; threadId: string },
+    draft: {
+      text: string;
+      images: ImageAttachment[];
+      options: SendOptions;
+    },
+  ) => void;
   initialQueue?: QueuedMessage[];
   onQueueChange?: (queue: QueuedMessage[]) => void;
   initialImages?: ImageAttachment[];
@@ -53,6 +67,8 @@ export default function ChatPane({
   visible?: boolean;
   permission?: SendOptions["permission"];
 }) {
+  const [showChanges, setShowChanges] = useState(false);
+  const [currentApprovalScope, setCurrentApprovalScope] = useState("");
   const [requests, setRequests] = useState<InteractionRequest[]>([]);
   const [forking, setForking] = useState(false);
   const forkLock = useRef(false);
@@ -304,6 +320,9 @@ export default function ChatPane({
     sendLock.current = true;
     onBusyChange?.(true);
     setSending(true);
+    setCurrentApprovalScope(
+      approvalScope(thread, (queued?.options ?? options).permission),
+    );
     setReady(false);
     setStopping(false);
     setSendError("");
@@ -331,6 +350,13 @@ export default function ChatPane({
         thread.id,
         text,
         (event) => {
+          if (event.type === "fileChange") {
+            setLive((previous) => [
+              ...previous.filter((m) => m.id !== event.message.id),
+              event.message,
+            ]);
+            return;
+          }
           if (event.type === "request") {
             setRequests((previous) => [
               ...previous.filter((item) => item.id !== event.id),
@@ -488,6 +514,32 @@ export default function ChatPane({
     }
   }
 
+  async function recoverThread() {
+    if (
+      !onFork ||
+      forkLock.current ||
+      sendLock.current ||
+      readingImagesRef.current
+    )
+      return;
+    forkLock.current = true;
+    setForking(true);
+    setForkError("");
+    const pending = {
+      text: draft,
+      images: [...imagesRef.current],
+      options: { ...options },
+    };
+    try {
+      onFork(await api.forkThread(thread.id), pending);
+    } catch (error) {
+      setForkError(errorMessage(error));
+    } finally {
+      forkLock.current = false;
+      setForking(false);
+    }
+  }
+
   return (
     <aside
       className="chat-pane"
@@ -497,62 +549,105 @@ export default function ChatPane({
     >
       <header className="chat-heading">
         <div>
-          <span className="eyebrow">CONVERSATION</span>
-          <h2 ref={heading} tabIndex={-1}>
+          <h2 ref={heading} tabIndex={-1} title={thread.title}>
             {thread.title}
           </h2>
         </div>
-        <button aria-label="チャット欄を閉じる" onClick={close}>
-          ×
-        </button>
-      </header>
-      <div className="chat-toolbar">
-        <span>最近のメッセージを表示</span>
-        <button
-          disabled={loading}
-          onClick={() => {
-            follow.current = true;
-            setReload((v) => v + 1);
-          }}
-        >
-          会話を再読み込み
-        </button>
-      </div>
-      {onFork && (
-        <div className="fork-controls">
+        <div className="chat-heading-actions">
+          <button
+            disabled={loading}
+            onClick={() => {
+              follow.current = true;
+              setReload((v) => v + 1);
+            }}
+            className="icon-button"
+            title="会話を再読み込み"
+          >
+            <Icon name="refresh" />
+            <span className="sr-only">会話を再読み込み</span>
+          </button>
           <button
             type="button"
-            disabled={sending || forking || loading || !page?.messages.length}
-            title="会話履歴を引き継いで新しいスレッドを作成"
-            onClick={async () => {
-              if (forkLock.current) return;
-              forkLock.current = true;
-              setForking(true);
-              setForkError("");
-              try {
-                onFork(await api.forkThread(thread.id));
-              } catch (error) {
-                setForkError(errorMessage(error));
-              } finally {
-                forkLock.current = false;
-                setForking(false);
-              }
-            }}
+            className="icon-button"
+            title="変更ファイル・差分"
+            aria-label="変更ファイル・差分"
+            aria-pressed={showChanges}
+            onClick={() => setShowChanges((value) => !value)}
           >
-            {forking ? "分岐を作成中…" : "この会話から分岐"}
+            <Icon name="diff" />
           </button>
-          {forkError && (
-            <p role="alert" className="chat-error">
-              {forkError}
-            </p>
+          {onFork && (
+            <button
+              type="button"
+              disabled={sending || forking || readingImages}
+              title="保存済みの会話と下書きを新しいスレッドに引き継ぐ"
+              onClick={recoverThread}
+              className="icon-button"
+            >
+              <Icon name="fork" />
+              <span className="sr-only">
+                {forking ? "引き継ぎ中…" : "新しいスレッドに引き継ぐ"}
+              </span>
+            </button>
           )}
+
+          {onToggleMaximized && (
+            <button
+              type="button"
+              aria-label={
+                maximized ? "チャット欄を元の幅に戻す" : "チャット欄を最大化"
+              }
+              aria-pressed={maximized}
+              title={
+                maximized ? "元に戻す（Esc）" : "チャットをウィンドウ全体に表示"
+              }
+              onClick={onToggleMaximized}
+              className="icon-button"
+            >
+              <Icon name={maximized ? "collapse" : "expand"} />
+              <span className="sr-only">
+                {maximized ? "元に戻す" : "最大化"}
+              </span>
+            </button>
+          )}
+          <button
+            aria-label="チャット欄を閉じる"
+            onClick={close}
+            className="icon-button"
+            title="チャット欄を閉じる"
+          >
+            <Icon name="close" />
+            <span className="sr-only">×</span>
+          </button>
         </div>
+      </header>
+      {showChanges && (
+        <ChangesPanel
+          messages={[...(page?.messages ?? []), ...live]}
+          hasMore={!!page?.nextCursor}
+          loading={loading}
+          onMore={() => {
+            follow.current = false;
+            void more();
+          }}
+          onClose={() => setShowChanges(false)}
+        />
+      )}
+      {forkError && (
+        <p role="alert" className="chat-error">
+          {forkError}
+        </p>
       )}
       {readError ? (
         <div role="alert" className="chat-error">
           <p>{readError}</p>
-          <button onClick={() => setReadRetry((v) => v + 1)}>
-            既読の保存を再試行
+          <button
+            onClick={() => setReadRetry((v) => v + 1)}
+            className="icon-button"
+            title="既読の保存を再試行"
+          >
+            <Icon name="refresh" />
+            <span className="sr-only">既読の保存を再試行</span>
           </button>
         </div>
       ) : null}
@@ -576,14 +671,16 @@ export default function ChatPane({
       >
         {page?.nextCursor ? (
           <button
-            className="load-more"
+            className="load-more icon-button"
             disabled={loading}
             onClick={() => {
               follow.current = false;
               void more();
             }}
+            title="以前のメッセージを読み込む"
           >
-            以前のメッセージを読み込む
+            <Icon name="history" />
+            <span className="sr-only">以前のメッセージを読み込む</span>
           </button>
         ) : null}
         {page?.messages.map((message) => (
@@ -607,8 +704,11 @@ export default function ChatPane({
                 else setReload((v) => v + 1);
               }}
               disabled={loading}
+              className="icon-button"
+              title="再試行"
             >
-              再試行
+              <Icon name="refresh" />
+              <span className="sr-only">再試行</span>
             </button>
           </div>
         ) : null}
@@ -636,6 +736,8 @@ export default function ChatPane({
               key={request.id}
               threadId={thread.id}
               request={request}
+              approvalScope={currentApprovalScope}
+              onRememberError={setSendError}
             />
           ))}
         </div>
@@ -684,26 +786,9 @@ export default function ChatPane({
             選択したモデル・推論強度を確認できません。選び直すか「スレッドの設定を使用」に戻してください。
           </p>
         ) : null}
-        <div className="attachment-toolbar">
-          <label htmlFor={inputId}>メッセージ</label>
-          <label className="image-file-picker">
-            ファイルを追加
-            <input
-              aria-label="ファイルを追加"
-              type="file"
-              multiple
-              disabled={thread.archived || readingImages}
-              onChange={(event) => {
-                void addImages(Array.from(event.target.files ?? []));
-                event.target.value = "";
-              }}
-            />
-          </label>
-        </div>
-        <small className="attachment-help">
-          全形式を添付可能 ·
-          4件まで・各5MB以下。読み取り可否はCodexのモデル・ツールによります。
-        </small>
+        <label className="sr-only" htmlFor={inputId}>
+          メッセージ
+        </label>
         {images.length > 0 && (
           <ul className="image-attachments" aria-label="添付ファイル">
             {images.map((image, index) => (
@@ -723,8 +808,11 @@ export default function ChatPane({
                   onClick={() =>
                     updateImages(images.filter((_, i) => i !== index))
                   }
+                  className="icon-button"
+                  title={`${image.name}を削除`}
                 >
-                  ×
+                  <Icon name="trash" />
+                  <span className="sr-only">×</span>
                 </button>
               </li>
             ))}
@@ -733,9 +821,10 @@ export default function ChatPane({
         {readingImages && <p role="status">ファイルを読み込み中…</p>}
         <textarea
           id={inputId}
+          title="Enterで改行 · ⌘ / Ctrl + Enterで送信（応答中はQueue）"
           value={draft}
           maxLength={32000}
-          rows={3}
+          rows={2}
           disabled={thread.archived}
           placeholder="メッセージを入力、またはファイルをドロップ…"
           onChange={(e) => updateDraft(e.target.value)}
@@ -753,7 +842,24 @@ export default function ChatPane({
           }}
         />
         <div className="composer-actions">
-          <small>
+          <label
+            className="image-file-picker icon-button"
+            title="ファイルを追加（4件まで・各5MB以下。読み取り可否はCodexのモデル・ツールによります）"
+          >
+            <Icon name="attach" />
+            <span className="sr-only">ファイルを追加</span>
+            <input
+              aria-label="ファイルを追加"
+              type="file"
+              multiple
+              disabled={thread.archived || readingImages}
+              onChange={(event) => {
+                void addImages(Array.from(event.target.files ?? []));
+                event.target.value = "";
+              }}
+            />
+          </label>
+          <small className="sr-only">
             Enter で改行 · ⌘ / Ctrl + Enter で{sending ? "Queue" : "送信"}
           </small>
           {sending ? (
@@ -770,8 +876,12 @@ export default function ChatPane({
                   (!draft.trim() && !images.length)
                 }
                 onClick={() => void steer()}
+                className="icon-button"
               >
-                {steering ? "送信中…" : "Steer"}
+                <Icon name="steer" />
+                <span className="sr-only">
+                  {steering ? "送信中…" : "Steer"}
+                </span>
               </button>
               <button
                 type="button"
@@ -785,15 +895,22 @@ export default function ChatPane({
                   (!draft.trim() && !images.length)
                 }
                 onClick={enqueue}
+                className="icon-button"
               >
-                Queue
+                <Icon name="queue" />
+                <span className="sr-only">Queue</span>
               </button>
               <button
                 type="button"
                 disabled={!ready || stopping}
                 onClick={() => void stopMessage()}
+                className="icon-button"
+                title={stopping ? "停止中…" : "応答を停止"}
               >
-                {stopping ? "停止中…" : "応答を停止"}
+                <Icon name="stop" />
+                <span className="sr-only">
+                  {stopping ? "停止中…" : "応答を停止"}
+                </span>
               </button>
             </div>
           ) : (
@@ -807,8 +924,11 @@ export default function ChatPane({
                 thread.archived ||
                 !optionsValid
               }
+              className="icon-button"
+              title="送信"
             >
-              送信
+              <Icon name="send" />
+              <span className="sr-only">送信</span>
             </button>
           )}
         </div>
@@ -837,8 +957,11 @@ export default function ChatPane({
                         ),
                       )
                     }
+                    className="icon-button"
+                    title="取消"
                   >
-                    取消
+                    <Icon name="close" />
+                    <span className="sr-only">取消</span>
                   </button>
                 </li>
               ))}
@@ -853,8 +976,11 @@ export default function ChatPane({
                   updateQueue(queueRef.current.slice(1));
                   void sendMessage(next);
                 }}
+                className="icon-button"
+                title="キューを再開"
               >
-                キューを再開
+                <Icon name="play" />
+                <span className="sr-only">キューを再開</span>
               </button>
             )}
           </section>
@@ -870,6 +996,18 @@ export default function ChatPane({
             <h3>{sendFailure.title}</h3>
             <p>{sendFailure.message}</p>
             <p>{sendFailure.action}</p>
+            {onFork && (
+              <button
+                type="button"
+                className="icon-button"
+                disabled={sending || forking || readingImages}
+                title="保存済み履歴と下書きを新しいスレッドへ引き継ぐ。実行中の処理は引き継がれません。"
+                onClick={recoverThread}
+              >
+                <Icon name="fork" />
+                <span className="sr-only">新しいスレッドに引き継いで復旧</span>
+              </button>
+            )}
             {!sendFailure.notSent ? (
               <button
                 type="button"
@@ -878,8 +1016,11 @@ export default function ChatPane({
                   follow.current = true;
                   setReload((v) => v + 1);
                 }}
+                className="icon-button"
+                title="会話を再読み込みして確認"
               >
-                会話を再読み込みして確認
+                <Icon name="refresh" />
+                <span className="sr-only">会話を再読み込みして確認</span>
               </button>
             ) : null}
             <details>

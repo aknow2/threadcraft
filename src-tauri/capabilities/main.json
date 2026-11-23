@@ -1,6 +1,6 @@
 {
   "identifier": "main",
-  "description": "Local board operations only; no filesystem or shell access from the webview.",
+  "description": "Local board and user-operated terminal commands for the main window.",
   "windows": ["main"],
   "permissions": [
     "allow-get-board",
@@ -29,6 +29,11 @@
     },
     "allow-steer-message",
     "allow-respond-to-request",
-    "allow-fork-thread"
+    "allow-fork-thread",
+    "allow-update-thread",
+    "allow-terminal-open",
+    "allow-terminal-write",
+    "allow-terminal-resize",
+    "allow-terminal-close"
   ]
 }

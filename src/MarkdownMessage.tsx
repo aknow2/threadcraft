@@ -1,6 +1,7 @@
 import { memo, useState, type ReactNode } from "react";
 import Markdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import MermaidDiagram from "./MermaidDiagram";
 
 import { openUrl } from "@tauri-apps/plugin-opener";
 
@@ -50,6 +51,24 @@ function ExternalLink({
 
 const plugins = [remarkGfm];
 const components: Components = {
+  pre: ({ node, children }) => {
+    const code = node?.children[0];
+    if (
+      code?.type === "element" &&
+      code.tagName === "code" &&
+      Array.isArray(code.properties.className) &&
+      code.properties.className.some((name) =>
+        /^language-(mermaid|mermaidjs)$/i.test(String(name)),
+      )
+    ) {
+      const source = code.children
+        .filter((child) => child.type === "text")
+        .map((child) => child.value)
+        .join("");
+      return <MermaidDiagram source={source} />;
+    }
+    return <pre>{children}</pre>;
+  },
   a: ({ href, children }) =>
     href && /^(https?:\/\/|mailto:)/i.test(href) ? (
       <ExternalLink href={href}>{children}</ExternalLink>

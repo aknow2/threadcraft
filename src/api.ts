@@ -30,6 +30,21 @@ export interface InteractionRequest {
   id: string;
   method: string;
   params: {
+    toolApproval?: {
+      server: string;
+      tool: string;
+      connectorId: string | null;
+      linkId: string | null;
+    } & (
+      | {
+          protocol?: "question";
+          questionId: string;
+          acceptLabel: string;
+          declineLabel: string;
+          cancelLabel?: string;
+        }
+      | { protocol: "elicitation" }
+    );
     reason?: string;
     message?: string;
     command?: string;
@@ -51,6 +66,7 @@ export interface InteractionRequest {
       options?: { label: string; description?: string }[];
     }[];
     requestedSchema?: {
+      type?: string;
       required?: string[];
       properties?: Record<
         string,
@@ -64,7 +80,16 @@ export interface InteractionRequest {
     };
   };
 }
+export interface FileChange {
+  status: string;
+  changes: {
+    path: string;
+    kind: { type: string; move_path?: string | null };
+    diff: string;
+  }[];
+}
 export type ChatEvent =
+  | { type: "fileChange"; message: ChatMessage }
   | ({ type: "request" } & InteractionRequest)
   | { type: "requestClosed"; id: string }
   | { type: "ready" }
@@ -86,6 +111,7 @@ export interface Group {
   name: string;
 }
 export interface ChatMessage {
+  fileChange?: FileChange;
   id: string;
   role: "user" | "assistant" | "activity";
   text: string;
@@ -101,6 +127,8 @@ export interface Board {
   threads: Thread[];
   lastSync: number | null;
 }
+export type ThreadUpdate =
+  { type: "rename"; name: string } | { type: "archive" | "restore" };
 export type Mutation =
   | { type: "createGroup"; name: string }
   | { type: "renameGroup"; id: string; name: string }
@@ -147,6 +175,8 @@ export const api = {
   },
   respondToRequest: (id: string, requestId: string, answer: unknown) =>
     call<void>("respond_to_request", { id, requestId, answer }),
+  updateThread: (id: string, update: ThreadUpdate) =>
+    call<Board>("update_thread", { id, update }),
   forkThread: (id: string) =>
     call<{ board: Board; threadId: string }>("fork_thread", { id }),
   steerMessage: (id: string, text: string, images: ImageAttachment[]) =>
@@ -202,7 +232,7 @@ export function chatSendError(error: unknown) {
       title: "このスレッドは別の Codex 接続で使用中です",
       message: "今回は送信されていません。入力文は下書きに残っています。",
       action:
-        "Zed・Codex アプリ・ターミナルなどで、このスレッドの Codex セッションを終了してから、もう一度「送信」を押してください。応答が終わっていてもセッションが残っている場合があります。",
+        "Zed・Codex アプリ・ターミナルなどで、このスレッドの Codex セッションを終了してから、もう一度「送信」を押してください。終了できない場合は、引き継ぎアイコンから保存済み履歴を新しいスレッドへ引き継げます。実行中の処理・承認待ちは引き継がれません。",
       detail,
     };
   return {

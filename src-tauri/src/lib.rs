@@ -7,6 +7,7 @@ mod interactions;
 mod model;
 mod models;
 mod store;
+mod terminal;
 
 use model::{AppError, Board, ChatPage, Mutation};
 use std::{
@@ -203,6 +204,65 @@ async fn fork_thread(
 }
 
 #[tauri::command]
+async fn update_thread(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, State>,
+    id: String,
+    update: model::ThreadUpdate,
+) -> Result<Board, AppError> {
+    authorize(&window)?;
+    update.validate()?;
+    let _guard = state.refresh.lock().await;
+    // Archive can affect spawned descendants, so exclude all local sends while editing metadata.
+    let _sending = state.sending.try_write().map_err(|_| {
+        AppError::Validation(
+            "実行中の応答が完了してから、改名・アーカイブ・復元を操作してください。".into(),
+        )
+    })?;
+    if *state.shutdown.borrow() {
+        return Err(AppError::Validation("終了処理中です。".into()));
+    }
+    let remote = database(Arc::clone(&state.store), move |store| {
+        if !store.board()?.threads.iter().any(|thread| thread.id == id) {
+            return Err(AppError::NotFound);
+        }
+        Ok(store.remote_id(&id)?.unwrap_or(id))
+    })
+    .await?;
+    let (source, raw): (String, String) =
+        serde_json::from_str(&remote).map_err(|_| AppError::NotFound)?;
+    if source != state.source {
+        return Err(AppError::NotFound);
+    }
+    if raw.starts_with("draft:") {
+        return Err(AppError::Validation(
+            "最初のメッセージを送信してから操作してください。".into(),
+        ));
+    }
+    let threads = codex::update_thread(
+        &state.executable,
+        &source,
+        &raw,
+        &update,
+        state.shutdown.subscribe(),
+    )
+    .await
+    .map_err(|error| {
+        AppError::SourceUnavailable(format!(
+            "操作結果を確認できませんでした。一覧を更新して状態を確認してください。{error}"
+        ))
+    })?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AppError::Storage)?
+        .as_secs() as i64;
+    database(Arc::clone(&state.store), move |store| {
+        store.sync(&threads, now)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn read_thread(
     window: tauri::WebviewWindow,
     state: tauri::State<'_, State>,
@@ -317,7 +377,10 @@ async fn send_message(
 ) -> Result<String, AppError> {
     authorize(&window)?;
     let images = images.unwrap_or_default();
-    let folder = window.path().app_data_dir().map_err(|_| AppError::Storage)?;
+    let folder = window
+        .path()
+        .app_data_dir()
+        .map_err(|_| AppError::Storage)?;
     let (text, images) = tauri::async_runtime::spawn_blocking(move || {
         attachments::prepare(text, images, &folder.join("attachments"))
     })
@@ -411,7 +474,10 @@ async fn steer_message(
     images: Vec<attachments::Attachment>,
 ) -> Result<(), AppError> {
     authorize(&window)?;
-    let folder = window.path().app_data_dir().map_err(|_| AppError::Storage)?;
+    let folder = window
+        .path()
+        .app_data_dir()
+        .map_err(|_| AppError::Storage)?;
     let (text, images) = tauri::async_runtime::spawn_blocking(move || {
         attachments::prepare(text, images, &folder.join("attachments"))
     })
@@ -445,6 +511,7 @@ fn stop_message(
 /// Starts the desktop app. Conversations are resumed only on explicit send.
 pub fn run() -> Result<(), tauri::Error> {
     tauri::Builder::default()
+        .manage(terminal::Terminals::default())
         .plugin(
             tauri_plugin_opener::Builder::new()
                 .open_js_links_on_click(false)
@@ -475,9 +542,14 @@ pub fn run() -> Result<(), tauri::Error> {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            terminal::terminal_open,
+            terminal::terminal_write,
+            terminal::terminal_resize,
+            terminal::terminal_close,
             get_board,
             create_thread,
             fork_thread,
+            update_thread,
             mutate_board,
             refresh_threads,
             read_thread,
@@ -492,6 +564,7 @@ pub fn run() -> Result<(), tauri::Error> {
         .build(tauri::generate_context!())?
         .run(|app, event| {
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                app.state::<terminal::Terminals>().shutdown();
                 let state = app.state::<State>();
                 state.shutdown.send_replace(true);
                 if state.refresh.try_lock().is_err()

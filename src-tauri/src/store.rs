@@ -156,8 +156,8 @@ impl Store {
             };
             let advances: bool = tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM threads WHERE id=?1 AND (updated_at IS NULL OR updated_at>=?2))", params![t.id,t.updated_at], |r| r.get(0))?;
             let renamed: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM threads WHERE id=?1 AND title<>?2)",
-                params![t.id, t.title],
+                "SELECT EXISTS(SELECT 1 FROM threads WHERE id=?1 AND (title<>?2 OR archived<>?3))",
+                params![t.id, t.title, t.archived],
                 |r| r.get(0),
             )?;
             changed |= renamed || (initialized && advances);
@@ -600,8 +600,14 @@ mod tests {
             )
             .unwrap();
         b.threads[0].archived = true;
-        let b = s.sync(&b.threads, 2).unwrap();
+        let before = b.revision;
+        let mut b = s.sync(&b.threads, 2).unwrap();
         assert!(b.threads[0].archived && b.threads[0].group_id.is_some());
+        assert!(b.revision > before);
+        b.threads[0].archived = false;
+        let restored = s.sync(&b.threads, 3).unwrap();
+        assert!(!restored.threads[0].archived && restored.threads[0].group_id.is_some());
+        assert!(restored.revision > b.revision);
     }
 
     #[test]

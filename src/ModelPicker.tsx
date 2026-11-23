@@ -1,3 +1,4 @@
+import Icon from "./Icon";
 import { type ModelOption, type SendOptions } from "./api";
 
 const effortLabels: Record<string, string> = {
@@ -33,8 +34,9 @@ export default function ModelPicker({
     <div className="model-settings">
       <div className="model-selectors">
         <label>
-          モデル
+          <span className="sr-only">モデル</span>
           <select
+            title="モデル"
             value={value.model ?? ""}
             disabled={disabled || loading}
             onChange={(e) => {
@@ -65,8 +67,9 @@ export default function ModelPicker({
           </select>
         </label>
         <label>
-          推論強度（グレード）
+          <span className="sr-only">推論強度（グレード）</span>
           <select
+            title="推論強度（グレード）"
             value={value.effort ?? ""}
             disabled={
               disabled || loading || !selected?.supportedReasoningEfforts.length
@@ -101,8 +104,9 @@ export default function ModelPicker({
           </select>
         </label>
         <label className="permission-selector">
-          実行権限
+          <span className="sr-only">実行権限</span>
           <select
+            title="実行権限"
             value={value.permission ?? "read-only"}
             disabled={disabled}
             onChange={(e) =>
@@ -119,13 +123,14 @@ export default function ModelPicker({
         </label>
         <button
           type="button"
-          className="model-reload"
+          className="model-reload icon-button"
           title={loading ? "モデル一覧を取得中…" : "モデル一覧を更新"}
           aria-label="モデル一覧を更新"
           disabled={disabled || loading}
           onClick={reload}
         >
-          ↻
+          <Icon name="refresh" />
+          <span className="sr-only">↻</span>
         </button>
       </div>
       {error ? (

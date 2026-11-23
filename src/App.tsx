@@ -1,4 +1,14 @@
 import {
+  loadDoing,
+  observeDoing,
+  dismissDoing,
+  saveDoing,
+} from "./doingPreferences";
+import ApprovalSettings from "./ApprovalSettings";
+import Icon from "./Icon";
+import {
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useRef,
@@ -16,6 +26,7 @@ import {
   type Group,
   type Mutation,
   type Thread,
+  type ThreadUpdate,
   type SendOptions,
   type ImageAttachment,
   type QueuedMessage,
@@ -23,6 +34,8 @@ import {
 import ChatPane from "./ChatPane";
 import { loadPermission, savePermission } from "./permissionPreferences";
 import { loadFavorites, saveFavorites } from "./favoritePreferences";
+
+const TerminalPane = lazy(() => import("./TerminalPane"));
 
 type Drag = { kind: "thread" | "group"; id: string };
 type Dialog = { kind: "create" } | { kind: "rename" | "delete"; group: Group };
@@ -35,8 +48,27 @@ const date = (seconds: number) =>
   });
 
 export default function App() {
+  const [threadEdit, setThreadEdit] = useState<Thread | null>(null);
+  const [showArchive, setShowArchive] = useState(false);
+  const [threadPending, setThreadPending] = useState(false);
+  const [threadError, setThreadError] = useState("");
+  const threadUpdateLock = useRef(false);
+  const [terminalCwd, setTerminalCwd] = useState<string | null>(null);
+  const [terminalVisible, setTerminalVisible] = useState(false);
   const isMac = /Mac/i.test(navigator.platform);
   const [board, setBoard] = useState<Board | null>(null);
+  const [doing, setDoing] = useState(loadDoing);
+  const [doingError, setDoingError] = useState("");
+  useEffect(() => {
+    if (board) setDoing((current) => observeDoing(current, board.threads));
+  }, [board]);
+  useEffect(() => {
+    setDoingError(
+      saveDoing(doing)
+        ? ""
+        : "Doingの状態を保存できませんでした。今回の起動中のみ保持します。",
+    );
+  }, [doing]);
   const [favorites, setFavorites] = useState(loadFavorites);
   const [favoriteError, setFavoriteError] = useState("");
   function toggleFavorite(id: string) {
@@ -53,6 +85,7 @@ export default function App() {
     setFavoriteError("");
   }
   const [selected, setSelected] = useState<Thread | null>(null);
+  const [chatMaximized, setChatMaximized] = useState(false);
   const [chatAutoFocus, setChatAutoFocus] = useState(true);
   const [chatOpenVersion, setChatOpenVersion] = useState(0);
   const pendingThreadFocus = useRef<Thread | null>(null);
@@ -63,6 +96,7 @@ export default function App() {
   const drafts = useRef(new Map<string, string>());
   const [defaultPermission, setDefaultPermission] = useState(loadPermission);
   const modelOptions = useRef(new Map<string, SendOptions>());
+  const [inboxTab, setInboxTab] = useState<"inbox" | "doing">("inbox");
   const inboxPane = useRef<HTMLElement>(null);
   const pendingInboxFocus = useRef<{ id: string; index: number } | null>(null);
   function selectThread(thread: Thread) {
@@ -102,7 +136,7 @@ export default function App() {
       inline: "nearest",
       behavior: "auto",
     });
-  }, [chatOpenVersion, collapsed, focusRequest, search]);
+  }, [chatOpenVersion, collapsed, focusRequest, search, inboxTab]);
 
   useEffect(() => {
     const focused = document.activeElement;
@@ -120,6 +154,7 @@ export default function App() {
     const thread =
       board?.threads.find((t) => t.id === targetThread.id) ?? targetThread;
     pendingThreadFocus.current = thread;
+    if (!thread.groupId) setInboxTab("inbox");
     setSearch("");
     if (thread.groupId)
       setCollapsed((previous) => {
@@ -144,6 +179,7 @@ export default function App() {
         event.keyCode === 229 ||
         event.repeat ||
         event.defaultPrevented ||
+        (selected && chatMaximized) ||
         dialog ||
         settings ||
         newChat ||
@@ -168,7 +204,7 @@ export default function App() {
     }
     window.addEventListener("keydown", focusGroup);
     return () => window.removeEventListener("keydown", focusGroup);
-  }, [board?.groups, dialog, settings, newChat]);
+  }, [board?.groups, dialog, settings, newChat, selected, chatMaximized]);
   const refreshLock = useRef(false);
   const retries = useRef(0);
   const accept = useCallback(
@@ -236,6 +272,37 @@ export default function App() {
       setBusy(false);
     }
   }
+  async function updateThread(
+    id: string,
+    update: ThreadUpdate,
+  ): Promise<boolean> {
+    if (threadUpdateLock.current || runningThreads.length) return false;
+    threadUpdateLock.current = true;
+    setThreadPending(true);
+    setThreadError("");
+    try {
+      const next = await api.updateThread(id, update);
+      accept(next);
+      setSelected((current) => {
+        if (!current) return null;
+        const updated = next.threads.find((thread) => thread.id === current.id);
+        return updated?.archived ? null : (updated ?? current);
+      });
+      if (
+        selected &&
+        next.threads.find((thread) => thread.id === selected.id)?.archived
+      )
+        setChatMaximized(false);
+      return true;
+    } catch (error) {
+      setThreadError(errorMessage(error));
+      return false;
+    } finally {
+      threadUpdateLock.current = false;
+      setThreadPending(false);
+    }
+  }
+
   function start(e: DragEvent, payload: Drag) {
     if (busy) {
       e.preventDefault();
@@ -292,54 +359,79 @@ export default function App() {
     if (!search.trim() && drag.id !== beforeId)
       void mutate({ type: "reorderGroup", id: drag.id, beforeId });
   }
-  function card(t: Thread) {
+  function card(t: Thread, doingView = false) {
     return (
       <article
         key={t.id}
         data-thread-id={t.id}
-        className={`thread ${selected?.id === t.id ? "selected" : ""} ${target === t.id ? "drop-before" : ""}`}
+        className={`thread ${doingView ? "doing-thread" : ""} ${selected?.id === t.id ? "selected" : ""} ${target === t.id ? "drop-before" : ""}`}
         onClick={(event) => {
           if (!(event.target as HTMLElement).closest("button,select,input")) {
-            if (t.groupId === null)
+            if (t.groupId === null && !doingView)
               event.currentTarget
                 .querySelector<HTMLButtonElement>(".thread-open")
                 ?.focus();
             else selectThread(t);
           }
         }}
-        onDragOver={(e) => over(e, t.id, "thread")}
-        onDrop={(e) => dropThread(e, t.groupId, t.groupId ? t.id : null)}
+        onDragOver={doingView ? undefined : (e) => over(e, t.id, "thread")}
+        onDrop={
+          doingView
+            ? undefined
+            : (e) => dropThread(e, t.groupId, t.groupId ? t.id : null)
+        }
       >
+        {doingView && (
+          <button
+            type="button"
+            className="doing-remove icon-button"
+            aria-label={`${t.title} をDoingから外す`}
+            title="Doingから外す（会話は残ります）"
+            onClick={(event) => {
+              event.stopPropagation();
+              const index = inbox.findIndex((thread) => thread.id === t.id);
+              pendingInboxFocus.current = {
+                id: t.id,
+                index: Math.max(0, index),
+              };
+              setDoing((current) => dismissDoing(current, t));
+            }}
+          >
+            <Icon name="close" />
+          </button>
+        )}
         <button
-          className="handle"
+          className="handle icon-button"
           aria-label={`${t.title} をドラッグ`}
           draggable={!busy}
           onDragStart={(e) => start(e, { kind: "thread", id: t.id })}
           onDragEnd={end}
           disabled={busy}
+          title={`${t.title} をドラッグ`}
         >
-          ⠿
+          <Icon name="grip" />
+          <span className="sr-only">⠿</span>
         </button>
         <button
           className="thread-body thread-open"
           aria-label={
-            t.groupId === null
+            t.groupId === null && !doingView
               ? `${t.title} を選択`
               : `${t.title} のチャットを表示`
           }
           title={
-            t.groupId === null
+            t.groupId === null && !doingView
               ? "クリックで選択・Enterでチャットを表示"
               : undefined
           }
           aria-pressed={selected?.id === t.id}
           onClick={(event) => {
-            if (t.groupId === null) event.currentTarget.focus();
+            if (t.groupId === null && !doingView) event.currentTarget.focus();
             else selectThread(t);
           }}
           onKeyDown={(event) => {
             if (
-              t.groupId === null &&
+              (t.groupId === null || doingView) &&
               event.key === "Enter" &&
               !event.nativeEvent.isComposing &&
               !event.ctrlKey &&
@@ -364,12 +456,52 @@ export default function App() {
           </h3>
           <p title={t.cwd}>
             {t.cwd.split(/[\\/]/).filter(Boolean).at(-1) || "作業場所不明"}{" "}
-            <span>· {date(t.createdAt)}</span>
+            <span title={doingView ? "更新日時" : "作成日時"}>
+              · {date(doingView ? t.updatedAt || t.createdAt : t.createdAt)}
+            </span>
+            {doingView && (
+              <span className="doing-card-group">
+                {board?.groups.find((group) => group.id === t.groupId)?.name ??
+                  "未分類"}
+                {t.archived ? " · アーカイブ済み" : ""}
+              </span>
+            )}
           </p>
         </button>
         <div className="thread-actions">
           <button
-            className="favorite-toggle"
+            type="button"
+            className="icon-button"
+            aria-label={`${t.title} の名前を変更`}
+            title={
+              runningThreads.length
+                ? "応答完了後に名前を変更できます"
+                : "スレッド名を変更"
+            }
+            disabled={threadPending || !!runningThreads.length}
+            onClick={() => {
+              setThreadError("");
+              setThreadEdit(t);
+            }}
+          >
+            <Icon name="edit" />
+          </button>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label={`${t.title} をアーカイブ`}
+            title={
+              runningThreads.length
+                ? "応答完了後にアーカイブできます"
+                : "スレッドと派生スレッドをアーカイブ"
+            }
+            disabled={threadPending || !!runningThreads.length}
+            onClick={() => void updateThread(t.id, { type: "archive" })}
+          >
+            <Icon name="archive" />
+          </button>
+          <button
+            className="favorite-toggle icon-button"
             aria-label={`${t.title} をお気に入り${favorites.has(t.id) ? "から解除" : "に登録"}`}
             aria-pressed={favorites.has(t.id)}
             title={
@@ -380,12 +512,15 @@ export default function App() {
               toggleFavorite(t.id);
             }}
           >
-            <span aria-hidden="true">{favorites.has(t.id) ? "★" : "☆"}</span>
+            <Icon name="star" />
+            <span className="sr-only">
+              <span aria-hidden="true">{favorites.has(t.id) ? "★" : "☆"}</span>
+            </span>
           </button>
           <button
-            className="open-editor"
+            className="open-editor icon-button"
             aria-label={`${t.title} のワークスペースを Zed で開く`}
-            title={t.cwd || "作業フォルダ不明"}
+            title={`Zedで開く: ${t.cwd || "作業フォルダ不明"}`}
             disabled={!t.cwd || openingEditor !== null}
             onClick={async (event) => {
               event.stopPropagation();
@@ -403,7 +538,10 @@ export default function App() {
               }
             }}
           >
-            {openingEditor === t.id ? "起動中…" : "Zedで開く ↗"}
+            <Icon name="external" />
+            <span className="sr-only">
+              {openingEditor === t.id ? "起動中…" : "Zedで開く ↗"}
+            </span>
           </button>
           <select
             aria-label={`${t.title} の移動先`}
@@ -429,15 +567,27 @@ export default function App() {
       </article>
     );
   }
-  const inbox = board ? visibleThreads(board, null, search) : [];
+  const inbox =
+    inboxTab === "doing"
+      ? (board?.threads ?? [])
+          .filter(
+            (thread) =>
+              doing.get(thread.id)?.active &&
+              thread.title
+                .toLocaleLowerCase()
+                .includes(search.trim().toLocaleLowerCase()),
+          )
+          .sort(
+            (a, b) =>
+              (a.updatedAt || a.createdAt) - (b.updatedAt || b.createdAt) ||
+              a.id.localeCompare(b.id),
+          )
+      : board
+        ? visibleThreads(board, null, search)
+        : [];
   useEffect(() => {
     const pending = pendingInboxFocus.current;
-    if (
-      !pending ||
-      !board ||
-      visibleThreads(board, null, search).some((t) => t.id === pending.id)
-    )
-      return;
+    if (!pending || !board || inbox.some((t) => t.id === pending.id)) return;
     pendingInboxFocus.current = null;
     const pane = inboxPane.current;
     if (
@@ -448,7 +598,7 @@ export default function App() {
       return;
     const buttons = pane.querySelectorAll<HTMLButtonElement>(".thread-open");
     (buttons[Math.min(pending.index, buttons.length - 1)] ?? pane).focus();
-  }, [board, search]);
+  }, [board, search, inboxTab, doing]);
 
   function inboxKeyDown(event: KeyboardEvent<HTMLElement>) {
     const element = event.target as HTMLElement;
@@ -563,6 +713,7 @@ export default function App() {
           document.activeElement !== document.body)
       )
         return;
+      setInboxTab("inbox");
       pendingThreadFocus.current = { ...thread, groupId: null };
       setFocusRequest((value) => value + 1);
     });
@@ -644,8 +795,19 @@ export default function App() {
   }
   return (
     <div
-      className="app"
+      className={`app${selected && chatMaximized ? " chat-maximized" : ""}`}
       onKeyDown={(e) => {
+        if (
+          e.key === "Escape" &&
+          chatMaximized &&
+          !e.nativeEvent.isComposing &&
+          !e.defaultPrevented &&
+          !dialog &&
+          !settings &&
+          !newChat
+        ) {
+          setChatMaximized(false);
+        }
         if (e.key === "Escape") end();
         unclassifySelected(e);
       }}
@@ -680,11 +842,54 @@ export default function App() {
               onChange={(e) => setSearch(e.target.value)}
             />
           </label>
-          <button onClick={() => void refresh()} disabled={syncing || !board}>
-            {syncing ? "同期中…" : "↻ 更新"}
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="アーカイブしたスレッド"
+            title={`アーカイブしたスレッド（${board?.threads.filter((thread) => thread.archived).length ?? 0}）`}
+            disabled={!board}
+            onClick={() => {
+              setThreadError("");
+              setShowArchive(true);
+            }}
+          >
+            <Icon name="archive" />
           </button>
-          <button aria-label="接続設定" onClick={() => setSettings(true)}>
-            設定
+          <button
+            onClick={() => void refresh()}
+            disabled={syncing || !board}
+            className="icon-button"
+            title={syncing ? "同期中…" : "↻ 更新"}
+          >
+            <Icon name="refresh" />
+            <span className="sr-only">{syncing ? "同期中…" : "↻ 更新"}</span>
+          </button>
+          <button
+            aria-label="ターミナルを開く"
+            aria-pressed={terminalVisible}
+            disabled={!terminalCwd && !selected?.cwd}
+            title={
+              terminalCwd
+                ? "起動済みのターミナルを表示"
+                : "チャットを開いて作業フォルダで起動"
+            }
+            onClick={() => {
+              if (!terminalCwd && selected?.cwd) setTerminalCwd(selected.cwd);
+              setTerminalVisible((value) => !value);
+            }}
+            className="icon-button"
+          >
+            <Icon name="terminal" />
+            <span className="sr-only">ターミナル</span>
+          </button>
+          <button
+            aria-label="接続設定"
+            onClick={() => setSettings(true)}
+            className="icon-button"
+            title="接続設定"
+          >
+            <Icon name="settings" />
+            <span className="sr-only">設定</span>
           </button>
         </div>
         {unreadThreads.length ? (
@@ -754,6 +959,16 @@ export default function App() {
           </nav>
         )}
       </header>
+      {threadError && !threadEdit && !showArchive && (
+        <p role="alert" className="notice error">
+          {threadError}
+        </p>
+      )}
+      {doingError && (
+        <p role="alert" className="notice error">
+          {doingError}
+        </p>
+      )}
       {favoriteError && (
         <p role="alert" className="notice error">
           {favoriteError}
@@ -783,8 +998,11 @@ export default function App() {
               setError("");
               void load();
             }}
+            className="icon-button"
+            title="再読み込み"
           >
-            再読み込み
+            <Icon name="refresh" />
+            <span className="sr-only">再読み込み</span>
           </button>
         </div>
       ) : null}
@@ -805,58 +1023,145 @@ export default function App() {
             tabIndex={-1}
             onKeyDown={inboxKeyDown}
             className={`inbox pane ${target === "inbox" ? "drop-active" : ""}`}
-            onDragOver={(e) => over(e, "inbox", "thread")}
-            onDrop={(e) => dropThread(e, null)}
+            onDragOver={
+              inboxTab === "inbox"
+                ? (e) => over(e, "inbox", "thread")
+                : undefined
+            }
+            onDrop={
+              inboxTab === "inbox" ? (e) => dropThread(e, null) : undefined
+            }
           >
+            <div
+              className="inbox-tabs"
+              role="tablist"
+              aria-label="左レーンの表示"
+            >
+              {(["inbox", "doing"] as const).map((tab) => (
+                <button
+                  type="button"
+                  role="tab"
+                  key={tab}
+                  id={`inbox-tab-${tab}`}
+                  aria-selected={inboxTab === tab}
+                  aria-controls="inbox-panel"
+                  tabIndex={inboxTab === tab ? 0 : -1}
+                  onClick={() => {
+                    pendingInboxFocus.current = null;
+                    setTarget(null);
+                    setInboxTab(tab);
+                  }}
+                  onKeyDown={(event) => {
+                    if (
+                      event.nativeEvent.isComposing ||
+                      event.ctrlKey ||
+                      event.metaKey ||
+                      event.altKey
+                    )
+                      return;
+                    if (
+                      !["ArrowLeft", "ArrowRight", "Home", "End"].includes(
+                        event.key,
+                      )
+                    )
+                      return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    const next =
+                      event.key === "Home"
+                        ? "inbox"
+                        : event.key === "End"
+                          ? "doing"
+                          : tab === "inbox"
+                            ? "doing"
+                            : "inbox";
+                    pendingInboxFocus.current = null;
+                    setTarget(null);
+                    setInboxTab(next);
+                    document.getElementById(`inbox-tab-${next}`)?.focus();
+                  }}
+                >
+                  {tab === "inbox" ? "未分類" : "Doing"}
+                </button>
+              ))}
+            </div>
             <div className="pane-heading">
               <div>
-                <span className="eyebrow">INBOX</span>
+                <span className="eyebrow">
+                  {inboxTab === "doing" ? "DOING" : "INBOX"}
+                </span>
                 <h2 id="inbox-title">
-                  未分類 <span className="count">{inbox.length}</span>
-                  {inbox.some((t) => t.unread) ? (
+                  {inboxTab === "doing" ? "Doing" : "未分類"}{" "}
+                  <span className="count">{inbox.length}</span>
+                  {inboxTab === "inbox" && inbox.some((t) => t.unread) ? (
                     <span className="unread-count">
                       未読 {inbox.filter((t) => t.unread).length}
                     </span>
                   ) : null}
                 </h2>
               </div>
-              <span className="caption">作成日時 · 新しい順</span>
+              <span className="caption">
+                {inboxTab === "doing"
+                  ? "更新日時 · 古い順"
+                  : "作成日時 · 新しい順"}
+              </span>
             </div>
             <p className="pane-description">
-              スレッドをグループへドラッグして編成
+              {inboxTab === "doing"
+                ? "未読で追加 · 確認後も残る · ×で完了"
+                : "スレッドをグループへドラッグして編成"}
             </p>
-            <div className="thread-list">
+            <div
+              className="thread-list"
+              role="tabpanel"
+              id="inbox-panel"
+              aria-labelledby={`inbox-tab-${inboxTab}`}
+              key={inboxTab}
+            >
               {!board ? (
                 <Empty
                   title={error ? "データを読み込めません" : "読み込み中…"}
                   text="デスクトップアプリからローカルのスレッドに接続します。"
                 />
               ) : inbox.length ? (
-                inbox.map(card)
+                inbox.map((thread) => card(thread, inboxTab === "doing"))
               ) : (
                 <Empty
                   title={
                     search
                       ? "一致するスレッドはありません"
-                      : "未分類のスレッドはありません"
+                      : inboxTab === "doing"
+                        ? "Doingのスレッドはありません"
+                        : "未分類のスレッドはありません"
                   }
-                  text="ここへドロップするとグループから外せます。"
+                  text={
+                    inboxTab === "doing"
+                      ? "未読が届くとここに追加されます。"
+                      : "ここへドロップするとグループから外せます。"
+                  }
                 />
               )}
             </div>
             <div className="inbox-footer">
               ↑↓ 選択 · Enter チャット · {isMac ? "⌘" : "Ctrl"}＋1〜9
               グループへ分類
-              <br />↙ ここへ戻して分類を解除
+              {inboxTab === "inbox" && (
+                <>
+                  <br />↙ ここへ戻して分類を解除
+                </>
+              )}
             </div>
             <button
-              className="new-chat-button primary"
+              className="new-chat-button primary icon-button"
               aria-label="新しいチャットを開始"
               title="新しいチャットを開始"
               disabled={!board || busy}
               onClick={() => setNewChat(true)}
             >
-              <span aria-hidden="true">＋</span>
+              <Icon name="plus" />
+              <span className="sr-only">
+                <span aria-hidden="true">＋</span>
+              </span>
             </button>
           </section>
           <div
@@ -891,11 +1196,13 @@ export default function App() {
                   </h2>
                 </div>
                 <button
-                  className="primary"
+                  className="primary icon-button"
                   disabled={!board || busy}
                   onClick={() => setDialog({ kind: "create" })}
+                  title="＋ グループ作成"
                 >
-                  ＋ グループ作成
+                  <Icon name="folder" />
+                  <span className="sr-only">＋ グループ作成</span>
                 </button>
               </div>
               <p className="pane-description">
@@ -933,7 +1240,7 @@ export default function App() {
                     >
                       <div className="group-heading">
                         <button
-                          className="handle"
+                          className="handle icon-button"
                           aria-label={`${g.name} をドラッグ`}
                           disabled={busy || !!search.trim()}
                           draggable={!busy && !search.trim()}
@@ -941,8 +1248,10 @@ export default function App() {
                             start(e, { kind: "group", id: g.id })
                           }
                           onDragEnd={end}
+                          title={`${g.name} をドラッグ`}
                         >
-                          ⠿
+                          <Icon name="grip" />
+                          <span className="sr-only">⠿</span>
                         </button>
                         <button
                           className="group-title"
@@ -975,8 +1284,11 @@ export default function App() {
                               beforeId: board.groups[index - 1].id,
                             })
                           }
+                          className="icon-button"
+                          title={`${g.name} を左へ`}
                         >
-                          ←
+                          <Icon name="left" />
+                          <span className="sr-only">←</span>
                         </button>
                         <button
                           aria-label={`${g.name} を右へ`}
@@ -992,8 +1304,11 @@ export default function App() {
                               beforeId: board.groups[index + 2]?.id ?? null,
                             })
                           }
+                          className="icon-button"
+                          title={`${g.name} を右へ`}
                         >
-                          →
+                          <Icon name="right" />
+                          <span className="sr-only">→</span>
                         </button>
                         <button
                           disabled={busy}
@@ -1001,24 +1316,29 @@ export default function App() {
                           onClick={() =>
                             setDialog({ kind: "rename", group: g })
                           }
+                          className="icon-button"
+                          title={`${g.name} の名前変更`}
                         >
-                          編集
+                          <Icon name="edit" />
+                          <span className="sr-only">編集</span>
                         </button>
                         <button
                           disabled={busy}
-                          className="delete"
+                          className="delete icon-button"
                           aria-label={`${g.name} を削除`}
                           onClick={() =>
                             setDialog({ kind: "delete", group: g })
                           }
+                          title={`${g.name} を削除`}
                         >
-                          ×
+                          <Icon name="trash" />
+                          <span className="sr-only">×</span>
                         </button>
                       </div>
                       {!closed ? (
                         <div className="group-content">
                           {threads.length ? (
-                            threads.map(card)
+                            threads.map((thread) => card(thread))
                           ) : (
                             <div className="drop-placeholder">
                               {search
@@ -1054,15 +1374,20 @@ export default function App() {
             <ChatPane
               key={thread.id}
               visible={selected?.id === thread.id}
+              maximized={chatMaximized}
+              onToggleMaximized={() => setChatMaximized((value) => !value)}
               autoFocus={chatAutoFocus && selected?.id === thread.id}
               thread={board?.threads.find((t) => t.id === thread.id) ?? thread}
               onReadBoard={accept}
-              onFork={(result) => {
+              onFork={(result, pending) => {
                 accept(result.board);
                 const fork = result.board.threads.find(
                   (item) => item.id === result.threadId,
                 );
                 if (fork) {
+                  drafts.current.set(fork.id, pending.text);
+                  imageDrafts.current.set(fork.id, pending.images);
+                  modelOptions.current.set(fork.id, pending.options);
                   setChatAutoFocus(true);
                   setSelected(fork);
                 }
@@ -1100,10 +1425,26 @@ export default function App() {
                     : current.filter((item) => item.id !== thread.id),
                 );
               }}
-              close={() => setSelected(null)}
+              close={() => {
+                setChatMaximized(false);
+                setSelected(null);
+              }}
             />
           ))}
       </main>
+      {terminalCwd && (
+        <Suspense fallback={<p role="status">ターミナルを読み込み中…</p>}>
+          <TerminalPane
+            cwd={terminalCwd}
+            visible={terminalVisible}
+            onHide={() => setTerminalVisible(false)}
+            onClose={() => {
+              setTerminalCwd(null);
+              setTerminalVisible(false);
+            }}
+          />
+        </Suspense>
+      )}
       {newChat && board ? (
         <NewChatDialog
           board={board}
@@ -1127,6 +1468,38 @@ export default function App() {
           }}
         />
       ) : null}
+      {showArchive && board && (
+        <ArchiveDialog
+          board={board}
+          pending={threadPending}
+          blocked={!!runningThreads.length}
+          error={threadError}
+          close={() => {
+            if (!threadPending) setShowArchive(false);
+          }}
+          restore={(id) => void updateThread(id, { type: "restore" })}
+          rename={(thread) => {
+            setThreadError("");
+            setThreadEdit(thread);
+          }}
+        />
+      )}
+      {threadEdit && (
+        <ThreadNameDialog
+          key={threadEdit.id}
+          thread={threadEdit}
+          pending={threadPending}
+          blocked={!!runningThreads.length}
+          error={threadError}
+          close={() => {
+            if (!threadPending) setThreadEdit(null);
+          }}
+          submit={async (name) => {
+            if (await updateThread(threadEdit.id, { type: "rename", name }))
+              setThreadEdit(null);
+          }}
+        />
+      )}
       {dialog ? (
         <GroupDialog
           error={error}
@@ -1151,7 +1524,8 @@ export default function App() {
         />
       ) : null}
       {settings ? (
-        <Modal title="接続について" close={() => setSettings(false)}>
+        <Modal title="接続・許可の設定" close={() => setSettings(false)}>
+          <ApprovalSettings />
           <p>
             導入済みの Codex CLI（0.153.4 以降）から一覧を取得します。CLI / VS
             Code / App Server のスレッドが対象です。
@@ -1165,8 +1539,13 @@ export default function App() {
             分類はこの端末の SQLite に保存します。Codex のセクションや通常の
             ChatGPT 会話とは同期しません。
           </p>
-          <button className="primary" onClick={() => setSettings(false)}>
-            閉じる
+          <button
+            className="primary icon-button"
+            onClick={() => setSettings(false)}
+            title="閉じる"
+          >
+            <Icon name="close" />
+            <span className="sr-only">閉じる</span>
           </button>
         </Modal>
       ) : null}
@@ -1321,15 +1700,26 @@ function NewChatDialog({
           </p>
         ) : null}
         <div className="dialog-actions">
-          <button type="button" disabled={pending} onClick={close}>
-            キャンセル
+          <button
+            type="button"
+            disabled={pending}
+            onClick={close}
+            className="icon-button"
+            title="キャンセル"
+          >
+            <Icon name="close" />
+            <span className="sr-only">キャンセル</span>
           </button>
           <button
             type="submit"
-            className="primary"
+            className="primary icon-button"
             disabled={pending || !valid}
+            title={pending ? "開始中…" : "会話を開始"}
           >
-            {pending ? "開始中…" : "会話を開始"}
+            <Icon name="check" />
+            <span className="sr-only">
+              {pending ? "開始中…" : "会話を開始"}
+            </span>
           </button>
         </div>
       </form>
@@ -1449,17 +1839,219 @@ function GroupDialog({
           </label>
         )}
         <div className="dialog-actions">
-          <button type="button" onClick={close} disabled={busy}>
-            キャンセル
+          <button
+            type="button"
+            onClick={close}
+            disabled={busy}
+            className="icon-button"
+            title="キャンセル"
+          >
+            <Icon name="close" />
+            <span className="sr-only">キャンセル</span>
           </button>
           <button
-            className={deleting ? "danger" : "primary"}
+            className={`icon-button ${deleting ? "danger" : "primary"}`}
             disabled={busy || (!deleting && !valid)}
+            title={busy ? "保存中…" : deleting ? "削除する" : "保存する"}
           >
-            {busy ? "保存中…" : deleting ? "削除する" : "保存する"}
+            <Icon name={deleting ? "trash" : "check"} />
+            <span className="sr-only">
+              {busy ? "保存中…" : deleting ? "削除する" : "保存する"}
+            </span>
           </button>
         </div>
       </form>
+    </Modal>
+  );
+}
+
+function ThreadNameDialog({
+  thread,
+  pending,
+  blocked,
+  error,
+  close,
+  submit,
+}: {
+  thread: Thread;
+  pending: boolean;
+  blocked: boolean;
+  error: string;
+  close: () => void;
+  submit: (name: string) => Promise<void>;
+}) {
+  const [name, setName] = useState(thread.title);
+  const composing = useRef(false);
+  const valid =
+    !!name.trim() &&
+    [...name.trim()].length <= 120 &&
+    !/[\u0000-\u001f\u007f-\u009f]/.test(name.trim());
+  return (
+    <Modal title="スレッド名を変更" close={close} locked={pending}>
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (valid && !composing.current && !pending && !blocked)
+            void submit(name.trim());
+        }}
+        onKeyDown={(event) => {
+          if (
+            event.key === "Enter" &&
+            (event.nativeEvent.isComposing ||
+              composing.current ||
+              event.keyCode === 229)
+          )
+            event.preventDefault();
+        }}
+      >
+        <label className="field">
+          スレッド名
+          <input
+            autoFocus
+            value={name}
+            disabled={pending}
+            onChange={(event) => setName(event.target.value)}
+            onCompositionStart={() => {
+              composing.current = true;
+            }}
+            onCompositionEnd={() => {
+              composing.current = false;
+            }}
+          />
+        </label>
+        <p className="caption">
+          1〜120文字。Codex側のスレッド名にも反映します。
+        </p>
+        {blocked && (
+          <p role="status">実行中の応答が完了してから操作できます。</p>
+        )}
+        {error && (
+          <p role="alert" className="chat-error">
+            {error}
+          </p>
+        )}
+        <div className="dialog-actions">
+          <button
+            type="button"
+            className="icon-button"
+            title="キャンセル"
+            aria-label="キャンセル"
+            disabled={pending}
+            onClick={close}
+          >
+            <Icon name="close" />
+          </button>
+          <button
+            type="submit"
+            className="primary icon-button"
+            title="名前を保存"
+            aria-label="名前を保存"
+            disabled={pending || blocked || !valid}
+          >
+            <Icon name="check" />
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function ArchiveDialog({
+  board,
+  pending,
+  blocked,
+  error,
+  close,
+  restore,
+  rename,
+}: {
+  board: Board;
+  pending: boolean;
+  blocked: boolean;
+  error: string;
+  close: () => void;
+  restore: (id: string) => void;
+  rename: (thread: Thread) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const archived = board.threads.filter((thread) => thread.archived);
+  const matching = archived.filter((thread) =>
+    `${thread.title} ${thread.cwd}`
+      .toLocaleLowerCase()
+      .includes(query.trim().toLocaleLowerCase()),
+  );
+  return (
+    <Modal title="アーカイブしたスレッド" close={close} locked={pending}>
+      <label className="field">
+        アーカイブを検索
+        <input
+          type="search"
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+        />
+      </label>
+      <p className="caption">
+        復元すると元の分類へ戻ります。派生スレッドは個別に復元できます。
+      </p>
+      {error && (
+        <p role="alert" className="chat-error">
+          {error}
+        </p>
+      )}
+      {blocked && <p role="status">実行中の応答が完了してから操作できます。</p>}
+      <div className="archive-list">
+        {matching.map((thread) => (
+          <article key={thread.id} className="archive-entry">
+            <div>
+              <h3>{thread.title}</h3>
+              <p title={thread.cwd}>
+                {board.groups.find((group) => group.id === thread.groupId)
+                  ?.name ?? "未分類"}{" "}
+                · {date(thread.updatedAt ?? thread.createdAt)}
+              </p>
+            </div>
+            <button
+              type="button"
+              className="icon-button"
+              title="スレッド名を変更"
+              aria-label={`${thread.title} の名前を変更`}
+              disabled={pending || blocked}
+              onClick={() => rename(thread)}
+            >
+              <Icon name="edit" />
+            </button>
+            <button
+              type="button"
+              className="icon-button"
+              title="元の分類へ復元"
+              aria-label={`${thread.title} を復元`}
+              disabled={pending || blocked}
+              onClick={() => restore(thread.id)}
+            >
+              <Icon name="restore" />
+            </button>
+          </article>
+        ))}
+        {!matching.length && (
+          <p className="caption">
+            {archived.length
+              ? "一致するスレッドはありません。"
+              : "アーカイブしたスレッドはありません。"}
+          </p>
+        )}
+      </div>
+      <div className="dialog-actions">
+        <button
+          type="button"
+          className="icon-button"
+          title="閉じる"
+          aria-label="閉じる"
+          disabled={pending}
+          onClick={close}
+        >
+          <Icon name="close" />
+        </button>
+      </div>
     </Modal>
   );
 }
